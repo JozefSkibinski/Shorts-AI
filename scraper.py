@@ -938,8 +938,17 @@ def scrape(
                     batch_writer.close(footer_extras=footer_extras)
                 except Exception as exc:
                     log.warning("batch_writer.close failed on shutdown: %s", exc)
-            sessions.close()
-            browser.close()
+            try:
+                sessions.close()
+            except Exception as exc:
+                log.warning("sessions.close failed on shutdown: %s", exc)
+            try:
+                browser.close()
+            except Exception as exc:
+                # Playwright on Windows sometimes reports
+                # "Connection closed while reading from the driver" if the
+                # Chromium process went away first. Not a real failure.
+                log.debug("browser.close race (ignored): %s", exc)
 
     append_summary(
         data_path, scanned, kept, skipped_ads, channel_counts, transcript_counts

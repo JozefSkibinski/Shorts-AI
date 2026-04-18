@@ -40,14 +40,14 @@ def test_dom_hit_flags_ad():
 
 def test_multiple_dom_hits_all_reported():
     page = FakePage(
-        hits=["ytd-ad-slot-renderer", ".ytp-ad-skip-button"],
+        hits=["ytd-ad-slot-renderer", ".ytp-ad-player-overlay-layout"],
         text="",
         href="",
     )
     v = classify(page, {})
     assert v.is_ad is True
     assert "dom:ytd-ad-slot-renderer" in v.reasons
-    assert "dom:.ytp-ad-skip-button" in v.reasons
+    assert "dom:.ytp-ad-player-overlay-layout" in v.reasons
 
 
 def test_text_sponsored_flags_ad():
@@ -130,4 +130,20 @@ def test_selectors_are_passed_to_page_evaluate():
     classify(page, {})
     assert page.evaluated_with is not None
     assert "ytd-ad-slot-renderer" in page.evaluated_with
-    assert ".ytp-ad-skip-button" in page.evaluated_with
+    assert ".ytp-ad-player-overlay-layout" in page.evaluated_with
+
+
+def test_stale_invisible_ad_nodes_do_not_trigger():
+    """The fake page only reports visible hits; invisible stale DOM
+    nodes from a previous ad shouldn't be returned in 'hits', so
+    classify() must not flag a clean Short.
+
+    (The visibility filter itself is enforced in the browser by
+    _probe_active_reel's JavaScript; this test documents the contract:
+    if the probe returns an empty hits list, classify does not add a
+    DOM reason.)
+    """
+    page = FakePage(hits=[], text="normal organic short content")
+    v = classify(page, {"duration_seconds": 45.0})
+    assert v.is_ad is False
+    assert v.reasons == []

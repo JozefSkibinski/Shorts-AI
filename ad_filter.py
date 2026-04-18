@@ -23,16 +23,22 @@ from playwright.sync_api import Page
 log = logging.getLogger(__name__)
 
 
-# DOM selectors, scoped to the active reel element. ``:scope`` so the query
-# doesn't leak into surrounding ads in the DOM.
+# DOM selectors, scoped to the active reel element.
+#
+# We previously matched a broad ``class*='ytp-ad-'`` wildcard here, but
+# YouTube leaves those DOM nodes in place (display:none) after an ad
+# finishes, so every subsequent organic Short would still match — every
+# video after an ad would be misclassified as an ad.
+#
+# Current rule: only the specific containers that YouTube actually
+# injects *and removes* per-ad, plus a visibility check applied in the
+# page probe below so hidden leftovers never trigger a false positive.
 AD_DOM_SELECTORS: tuple[str, ...] = (
     "ytd-ad-slot-renderer",
     "ytd-promoted-sparkles-text-search-renderer",
-    "[class*='ad-badge']",
-    "[class*='ad-simple-attributed-string']",
-    "[class*='ytp-ad-']",
-    ".ytp-ad-skip-button",
-    ".ytp-skip-ad-button",
+    ".ytp-ad-player-overlay-layout",
+    ".ytp-ad-preview-container",
+    ".badge-style-type-ad",
 )
 
 # Visible text. Lowercased match against the active reel's innerText.
@@ -62,16 +68,34 @@ class AdVerdict:
 
 
 def _probe_active_reel(page: Page) -> dict:
-    """Collect DOM state from the active Short in one round-trip."""
+    """Collect DOM state from the active Short in one round-trip.
+
+    Ad-indicator DOM hits are only counted when the element is actually
+    visible — YouTube leaves hidden ad overlays in the DOM after an ad
+    finishes, and matching those would misclassify every following
+    organic Short as an ad.
+    """
     script = """
     (selectors) => {
         const active = document.querySelector('ytd-reel-video-renderer[is-active]')
             || document.querySelector('ytd-shorts ytd-reel-video-renderer');
         if (!active) return {hits: [], text: '', href: location.href};
+        const isVisible = (el) => {
+            if (!el) return false;
+            if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') return false;
+            const r = el.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) return false;
+            const s = getComputedStyle(el);
+            if (s.visibility === 'hidden' || s.display === 'none' || parseFloat(s.opacity) === 0) return false;
+            return true;
+        };
         const hits = [];
         for (const sel of selectors) {
             try {
-                if (active.querySelector(sel)) hits.push(sel);
+                const matches = active.querySelectorAll(sel);
+                for (const el of matches) {
+                    if (isVisible(el)) { hits.push(sel); break; }
+                }
             } catch (_) {}
         }
         return {
