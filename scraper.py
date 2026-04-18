@@ -53,7 +53,9 @@ try:
 except ImportError:  # runtime check with a clear message
     yt_dlp = None  # type: ignore[assignment]
 
+import ad_filter
 import stats as stats_module
+from session_manager import SessionManager
 
 
 SHORTS_URL = "https://www.youtube.com/shorts"
@@ -83,6 +85,10 @@ class ShortRecord:
     hook: str | None = None
     metadata_source: str = ""
     transcript_source: str = "none"
+    has_paid_promotion_disclosure: bool = False
+    session_id: str = ""
+    user_agent: str = ""
+    viewport: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +348,10 @@ def _parse_player_payload(payload: dict) -> dict:
         duration = float(details.get("lengthSeconds") or 0) or None
     except (TypeError, ValueError):
         duration = None
+
+    ad_placements = payload.get("adPlacements") or []
+    playability = (payload.get("playabilityStatus") or {}).get("status")
+
     return {
         "title": (details.get("title") or "").strip(),
         "channel": (details.get("author") or "").strip(),
@@ -349,6 +359,9 @@ def _parse_player_payload(payload: dict) -> dict:
         "view_count": views,
         "duration_seconds": duration,
         "keywords": list(details.get("keywords") or []),
+        "ad_placements": bool(ad_placements),
+        "is_ad_flag": bool(details.get("isAd")),
+        "playability_status": playability,
     }
 
 
@@ -522,23 +535,43 @@ def current_video_id(page: Page) -> str | None:
     return vid
 
 
-def is_current_ad(page: Page) -> bool:
-    """Return True if the currently visible Short appears to be an ad."""
+def context_for_session(sessions: SessionManager) -> BrowserContext:
+    """Return the BrowserContext of the currently active session.
+
+    ``resolve_metadata`` needs a context for its HTTP fallback path; this
+    lets it share the session's cookies + headers so the request matches
+    what the page itself would send.
+    """
+    current = sessions.current
+    if current is None:
+        raise RuntimeError("context_for_session called before any session exists")
+    return current.context
+
+
+def _log_ad_drop(
+    ads_path: Path,
+    video_id: str,
+    session_id: str | None,
+    verdict: "ad_filter.AdVerdict",
+) -> None:
+    """Append one line to ads_filtered.jsonl for audit spot-checks."""
     try:
-        return bool(
-            page.evaluate(
-                """() => {
-                    const a = document.querySelector('ytd-reel-video-renderer[is-active]');
-                    if (!a) return false;
-                    if (a.querySelector('ytd-ad-slot-renderer, .ytp-ad-player-overlay-layout, .ytp-ad-text')) return true;
-                    const badge = a.querySelector('[class*="badge-shape"], .ytd-badge-supported-renderer');
-                    if (badge && /sponsored|ad/i.test(badge.innerText || '')) return true;
-                    return false;
-                }"""
-            )
-        )
-    except Exception:
-        return False
+        payload = {
+            "video_id": video_id,
+            "session_id": session_id or "",
+            "reasons": verdict.reasons,
+            "url": f"https://www.youtube.com/shorts/{video_id}",
+            "ts": time.time(),
+        }
+        with ads_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        log.debug("Could not write ads_filtered line: %s", exc)
+    log.info(
+        "dropped ad %s (reasons=%s)",
+        video_id,
+        ",".join(verdict.reasons[:3]),
+    )
 
 
 def advance(page: Page, previous_id: str | None) -> str | None:
@@ -691,6 +724,7 @@ def scrape(
     output_dir.mkdir(parents=True, exist_ok=True)
     data_path = output_dir / "data.txt"
     jsonl_path = output_dir / "shorts.jsonl"
+    ads_path = output_dir / "ads_filtered.jsonl"
 
     store = MetadataStore()
     resumed_ids = load_previous_ids(jsonl_path)
@@ -704,120 +738,124 @@ def scrape(
     channel_counts: dict[str, int] = {}
     transcript_counts: dict[str, int] = {}
 
+    def _setup_context(ctx: BrowserContext) -> None:
+        # Every new incognito context needs its own player-response listener.
+        install_player_interceptor(ctx, store)
+
     with sync_playwright() as pw:
         browser: Browser = pw.chromium.launch(
             headless=headless,
             args=["--disable-blink-features=AutomationControlled", "--incognito"],
         )
-        context: BrowserContext = browser.new_context(
-            user_agent=USER_AGENT,
-            viewport={"width": 430, "height": 900},
-            locale="en-US",
-            java_script_enabled=True,
+        sessions = SessionManager(
+            browser,
+            output_dir=output_dir,
+            context_setup=_setup_context,
         )
-        context.clear_cookies()
-        install_player_interceptor(context, store)
-
-        page = context.new_page()
-        log.info("Opening %s (incognito)", SHORTS_URL)
-        page.goto(SHORTS_URL, wait_until="domcontentloaded", timeout=60_000)
-        dismiss_consent(page)
-
-        try:
-            page.wait_for_selector("ytd-reel-video-renderer", timeout=30_000)
-        except PlaywrightTimeoutError:
-            log.error("Shorts feed never loaded")
-            browser.close()
-            return
-
-        page.wait_for_timeout(2500)
 
         last_id: str | None = None
-        while scanned < max_videos:
-            page.wait_for_timeout(800)
-            video_id = current_video_id(page)
-            if not video_id:
-                empty_streak += 1
-                if empty_streak > 5:
-                    log.warning("Too many empty reads, stopping")
-                    break
-                last_id = advance(page, last_id)
-                continue
-            empty_streak = 0
+        try:
+            while scanned < max_videos:
+                page = sessions.page()  # rotates silently when the session ages out
+                page.wait_for_timeout(800)
 
-            if is_current_ad(page):
-                skipped_ads += 1
-                log.info("skipped ad")
+                video_id = current_video_id(page)
+                if not video_id:
+                    empty_streak += 1
+                    if empty_streak > 5:
+                        log.warning("Too many empty reads, stopping")
+                        break
+                    last_id = advance(page, last_id)
+                    continue
+                empty_streak = 0
+
+                # Resolve metadata before the ad check so adPlacements/isAd
+                # flags from the player response feed into the verdict.
+                time.sleep(0.5)
+                meta = resolve_metadata(context_for_session(sessions), store, video_id)
+
+                verdict = ad_filter.classify(page, meta)
+                if verdict.is_ad:
+                    skipped_ads += 1
+                    sessions.record_ad()
+                    _log_ad_drop(ads_path, video_id, sessions.current_id, verdict)
+                    last_id = advance(page, video_id)
+                    continue
+
+                if video_id in seen_ids:
+                    last_id = advance(page, video_id)
+                    continue
+                seen_ids.add(video_id)
+                scanned += 1
+
+                views = int(meta.get("view_count") or 0)
+                title = meta.get("title") or ""
+                channel = meta.get("channel") or ""
+                description = meta.get("description") or ""
+                keywords = meta.get("keywords") or []
+                duration = meta.get("duration_seconds")
+                source = meta.get("source") or "none"
+
+                log.info(
+                    "[%d] %s | %s | %s views (src=%s)",
+                    scanned,
+                    (channel or "?")[:30],
+                    (title or "?")[:50],
+                    f"{views:,}",
+                    source,
+                )
+
+                if views < min_views:
+                    last_id = advance(page, video_id)
+                    continue
+
+                transcript, hook, t_source = fetch_transcript(video_id, whisper_model)
+                hashtags = extract_hashtags(title, description)
+                for kw in keywords:
+                    if kw.startswith("#") and kw not in hashtags:
+                        hashtags.append(kw)
+
+                session = sessions.current
+                record = ShortRecord(
+                    video_id=video_id,
+                    url=f"https://www.youtube.com/shorts/{video_id}",
+                    channel=channel,
+                    title=title,
+                    description=description,
+                    hashtags=hashtags,
+                    keywords=list(keywords),
+                    view_count=views,
+                    duration_seconds=duration,
+                    transcript=transcript,
+                    hook=hook,
+                    metadata_source=source,
+                    transcript_source=t_source,
+                    has_paid_promotion_disclosure=verdict.has_paid_promotion_disclosure,
+                    session_id=session.id if session else "",
+                    user_agent=session.user_agent if session else "",
+                    viewport=(
+                        f"{session.viewport['width']}x{session.viewport['height']}"
+                        if session
+                        else ""
+                    ),
+                )
+                append_record(data_path, jsonl_path, record)
+                kept += 1
+                sessions.record_kept(channel)
+                if channel:
+                    channel_counts[channel] = channel_counts.get(channel, 0) + 1
+                transcript_counts[t_source] = transcript_counts.get(t_source, 0) + 1
+                log.info(
+                    "  -> saved (%d total >= %d views, transcript=%s)",
+                    kept,
+                    min_views,
+                    t_source,
+                )
+
                 last_id = advance(page, video_id)
-                continue
-
-            if video_id in seen_ids:
-                last_id = advance(page, video_id)
-                continue
-            seen_ids.add(video_id)
-            scanned += 1
-
-            # Give the interceptor a moment to catch this video's /player call
-            time.sleep(0.5)
-            meta = resolve_metadata(context, store, video_id)
-
-            views = int(meta.get("view_count") or 0)
-            title = meta.get("title") or ""
-            channel = meta.get("channel") or ""
-            description = meta.get("description") or ""
-            keywords = meta.get("keywords") or []
-            duration = meta.get("duration_seconds")
-            source = meta.get("source") or "none"
-
-            log.info(
-                "[%d] %s | %s | %s views (src=%s)",
-                scanned,
-                (channel or "?")[:30],
-                (title or "?")[:50],
-                f"{views:,}",
-                source,
-            )
-
-            if views < min_views:
-                last_id = advance(page, video_id)
-                continue
-
-            transcript, hook, t_source = fetch_transcript(video_id, whisper_model)
-            hashtags = extract_hashtags(title, description)
-            for kw in keywords:
-                if kw.startswith("#") and kw not in hashtags:
-                    hashtags.append(kw)
-
-            record = ShortRecord(
-                video_id=video_id,
-                url=f"https://www.youtube.com/shorts/{video_id}",
-                channel=channel,
-                title=title,
-                description=description,
-                hashtags=hashtags,
-                keywords=list(keywords),
-                view_count=views,
-                duration_seconds=duration,
-                transcript=transcript,
-                hook=hook,
-                metadata_source=source,
-                transcript_source=t_source,
-            )
-            append_record(data_path, jsonl_path, record)
-            kept += 1
-            if channel:
-                channel_counts[channel] = channel_counts.get(channel, 0) + 1
-            transcript_counts[t_source] = transcript_counts.get(t_source, 0) + 1
-            log.info(
-                "  -> saved (%d total >= %d views, transcript=%s)",
-                kept,
-                min_views,
-                t_source,
-            )
-
-            last_id = advance(page, video_id)
-
-        browser.close()
+        finally:
+            sessions.close()
+            browser.close()
 
     append_summary(
         data_path, scanned, kept, skipped_ads, channel_counts, transcript_counts
