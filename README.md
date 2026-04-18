@@ -58,12 +58,29 @@ match wins:
 The `Source:` line in each `data.txt` block tells you which source
 produced that record, so if views look wrong you know where to look.
 
+## How the transcript/hook is resolved
+
+1. **Captions** — `youtube-transcript-api` (no API key needed).
+2. **Whisper** — if captions are unavailable, the Short's audio is
+   downloaded with yt-dlp and transcribed locally with `faster-whisper`.
+   The `tiny` model runs on CPU in ~1–3s per Short and is loaded once
+   per run.
+
+The hook is always the concatenated text from the first 7 seconds of
+whichever transcript succeeded. Each `data.txt` block includes a
+`Transcript source:` line (`captions`, `whisper`, or `none`).
+
+Relevant flags:
+
+- `--whisper-model tiny|base|small|medium` (default `tiny`)
+- `--no-whisper` to skip the audio-transcription fallback
+
+Whisper needs `ffmpeg` on the system PATH — install via your package
+manager (`brew install ffmpeg`, `apt install ffmpeg`, etc).
+
 ## Notes
 
 - The browser launches with `--incognito` and a fresh context with no
   `storage_state`, so no cookies or history follow between runs.
 - Scrolling uses `ArrowDown`, which YouTube treats as "next Short".
   Random 1.5–2.8s delays between advances mimic human pacing.
-- Transcripts come from `youtube-transcript-api` (no API key needed).
-  Shorts without captions record `(no captions)` in the hook/transcript
-  fields.

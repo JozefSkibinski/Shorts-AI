@@ -79,6 +79,7 @@ class ShortRecord:
     transcript: str | None = None
     hook: str | None = None
     metadata_source: str = ""
+    transcript_source: str = "none"
 
 
 # ---------------------------------------------------------------------------
@@ -109,26 +110,141 @@ def extract_video_id(url: str) -> str | None:
 # Transcript + hook
 # ---------------------------------------------------------------------------
 
+# Cached Whisper model (created once per run, lazily)
+_WHISPER_MODEL = None
+_WHISPER_MODEL_NAME: str | None = None
 
-def fetch_transcript(video_id: str) -> tuple[str | None, str | None]:
+
+def _get_whisper_model(name: str):
+    """Load a faster-whisper model on first use and cache it."""
+    global _WHISPER_MODEL, _WHISPER_MODEL_NAME
+    if _WHISPER_MODEL is not None and _WHISPER_MODEL_NAME == name:
+        return _WHISPER_MODEL
     try:
-        snippets = YouTubeTranscriptApi.get_transcript(
-            video_id, languages=["en", "en-US", "en-GB"]
-        )
-    except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable):
-        return None, None
+        from faster_whisper import WhisperModel
+    except ImportError:
+        return None
+    try:
+        log.info("Loading Whisper model '%s' (first use downloads weights)...", name)
+        _WHISPER_MODEL = WhisperModel(name, device="cpu", compute_type="int8")
+        _WHISPER_MODEL_NAME = name
     except Exception as exc:
-        log.debug("Transcript failed for %s: %s", video_id, exc)
-        return None, None
+        log.warning("Could not load Whisper model '%s': %s", name, exc)
+        _WHISPER_MODEL = None
+    return _WHISPER_MODEL
 
-    full = " ".join(s["text"].strip() for s in snippets if s.get("text"))
+
+def transcribe_with_whisper(video_id: str, model_name: str) -> list[dict] | None:
+    """Download audio with yt-dlp, transcribe with faster-whisper.
+
+    Returns a list of {text, start, duration} segments compatible with the
+    captions path, or None if anything fails.
+    """
+    if yt_dlp is None:
+        return None
+
+    model = _get_whisper_model(model_name)
+    if model is None:
+        return None
+
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "format": "bestaudio/best",
+                "outtmpl": str(tmp_path / "%(id)s.%(ext)s"),
+                "socket_timeout": 30,
+            }
+            url = f"https://www.youtube.com/shorts/{video_id}"
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=True)
+
+            audio = next(tmp_path.glob(f"{video_id}.*"), None)
+            if audio is None:
+                log.debug("no audio file for %s", video_id)
+                return None
+
+            segments, _info = model.transcribe(
+                str(audio),
+                beam_size=1,
+                vad_filter=True,
+                language=None,
+            )
+            return [
+                {
+                    "text": seg.text.strip(),
+                    "start": float(seg.start or 0.0),
+                    "duration": float((seg.end or 0.0) - (seg.start or 0.0)),
+                }
+                for seg in segments
+                if seg.text and seg.text.strip()
+            ]
+    except Exception as exc:
+        log.debug("whisper transcription failed for %s: %s", video_id, exc)
+        return None
+
+
+def _snippets_to_transcript_and_hook(
+    snippets: list[dict],
+) -> tuple[str | None, str | None]:
+    full = " ".join(s["text"].strip() for s in snippets if s.get("text")).strip()
     hook_parts = [
         s["text"].strip()
         for s in snippets
         if s.get("text") and s.get("start", 0) < HOOK_SECONDS
     ]
-    hook = " ".join(hook_parts) if hook_parts else None
-    return full.strip() or None, hook
+    hook = " ".join(hook_parts).strip() or None
+    return full or None, hook
+
+
+def _fetch_captions(video_id: str) -> list[dict] | None:
+    """Call youtube-transcript-api on either 0.6 or 1.x."""
+    languages = ["en", "en-US", "en-GB"]
+    try:
+        if hasattr(YouTubeTranscriptApi, "get_transcript"):
+            return YouTubeTranscriptApi.get_transcript(
+                video_id, languages=languages
+            )
+        fetched = YouTubeTranscriptApi().fetch(video_id, languages=languages)
+        if hasattr(fetched, "to_raw_data"):
+            return fetched.to_raw_data()
+        return [
+            {"text": s.text, "start": s.start, "duration": s.duration}
+            for s in fetched
+        ]
+    except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable):
+        return None
+    except Exception as exc:
+        log.debug("Captions fetch failed for %s: %s", video_id, exc)
+        return None
+
+
+def fetch_transcript(
+    video_id: str, whisper_model: str | None
+) -> tuple[str | None, str | None, str]:
+    """Return (full_transcript, hook, source).
+
+    ``source`` is one of ``captions``, ``whisper``, or ``none``.
+    """
+    snippets = _fetch_captions(video_id)
+
+    if snippets:
+        full, hook = _snippets_to_transcript_and_hook(snippets)
+        if full or hook:
+            return full, hook, "captions"
+
+    if whisper_model:
+        whispered = transcribe_with_whisper(video_id, whisper_model)
+        if whispered:
+            full, hook = _snippets_to_transcript_and_hook(whispered)
+            if full or hook:
+                return full, hook, "whisper"
+
+    return None, None, "none"
 
 
 # ---------------------------------------------------------------------------
@@ -422,8 +538,9 @@ def format_duration(seconds: float | None) -> str:
 
 def format_record(record: ShortRecord) -> str:
     hashtags = " ".join(record.hashtags) if record.hashtags else "(none)"
-    hook = record.hook or "(no captions)"
-    transcript = record.transcript or "(no captions)"
+    no_text = "(no transcript available)"
+    hook = record.hook or no_text
+    transcript = record.transcript or no_text
     description = record.description.strip() or "(empty)"
 
     return (
@@ -434,10 +551,11 @@ def format_record(record: ShortRecord) -> str:
         f"Length: {format_duration(record.duration_seconds)}\n"
         f"Link: {record.url}\n"
         f"Hashtags: {hashtags}\n"
-        f"Source: {record.metadata_source or '(unknown)'}\n"
+        f"Metadata source: {record.metadata_source or '(unknown)'}\n"
+        f"Transcript source: {record.transcript_source}\n"
         "--- Description ---\n"
         f"{description}\n"
-        "--- Hook (first 7s) ---\n"
+        f"--- Hook (first {int(HOOK_SECONDS)}s) ---\n"
         f"{hook}\n"
         "--- Transcript ---\n"
         f"{transcript}\n"
@@ -462,6 +580,7 @@ def scrape(
     output_dir: Path,
     headless: bool,
     min_views: int,
+    whisper_model: str | None,
 ) -> None:
     if yt_dlp is None:
         log.warning(
@@ -550,7 +669,7 @@ def scrape(
                 advance(page)
                 continue
 
-            transcript, hook = fetch_transcript(video_id)
+            transcript, hook, t_source = fetch_transcript(video_id, whisper_model)
             hashtags = extract_hashtags(title, description)
             for kw in keywords:
                 if kw.startswith("#") and kw not in hashtags:
@@ -568,10 +687,16 @@ def scrape(
                 transcript=transcript,
                 hook=hook,
                 metadata_source=source,
+                transcript_source=t_source,
             )
             append_record(data_path, jsonl_path, record)
             kept += 1
-            log.info("  -> saved (%d total >= %d views)", kept, min_views)
+            log.info(
+                "  -> saved (%d total >= %d views, transcript=%s)",
+                kept,
+                min_views,
+                t_source,
+            )
 
             advance(page)
 
@@ -586,6 +711,19 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-views", type=int, default=MIN_VIEWS)
     parser.add_argument("--output-dir", type=Path, default=Path("output"))
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument(
+        "--whisper-model",
+        default="tiny",
+        help="faster-whisper model to use when captions are missing "
+        "(tiny/base/small/medium). Default: tiny.",
+    )
+    parser.add_argument(
+        "--no-whisper",
+        dest="whisper_enabled",
+        action="store_false",
+        help="Disable Whisper fallback; use captions only.",
+    )
+    parser.set_defaults(whisper_enabled=True)
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args(argv)
 
@@ -597,12 +735,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
+    whisper_model = args.whisper_model if args.whisper_enabled else None
     try:
         scrape(
             max_videos=args.max_videos,
             output_dir=args.output_dir,
             headless=args.headless,
             min_views=args.min_views,
+            whisper_model=whisper_model,
         )
     except KeyboardInterrupt:
         log.info("Interrupted by user")
