@@ -91,6 +91,43 @@ For Phase 1:
 
 ---
 
+## Phase 1 — running the data foundation
+
+```bash
+cd shorts_ai
+cp .env.example .env                           # then fill in ANTHROPIC_API_KEY etc.
+docker compose up -d postgres redis
+pip install -r requirements.txt
+alembic upgrade head
+python -m app.scripts.seed_niches
+celery -A workers.celery_app worker --loglevel=info &
+python -m app.scraper_bridge --backfill        # ingest existing scraper output
+python -m app.scraper_bridge --watch &         # tail new lines as the scraper runs
+uvicorn app.api.main:app --reload
+```
+
+Verify:
+
+```bash
+curl http://localhost:8000/health
+curl 'http://localhost:8000/trending/finance_money?timeframe_hours=72&limit=5'
+```
+
+Tests (no DB required):
+
+```bash
+cd shorts_ai && pytest tests/
+```
+
+Phase 1 exit criteria (per spec):
+
+- 1000+ scraped videos fully enriched in DB
+- `SELECT COUNT(*) FROM video_analyses WHERE text_embedding IS NULL` returns 0
+- Vector search works
+- Velocity metrics populated and sortable per niche
+
+---
+
 ## The scraper (existing)
 
 Automated YouTube Shorts scraper. Opens `youtube.com/shorts` in an incognito
