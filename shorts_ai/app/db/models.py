@@ -1,9 +1,10 @@
-"""SQLAlchemy models matching alembic/versions/001_initial.sql."""
+"""SQLAlchemy models matching alembic/versions/001_initial.sql + 002_scraper_hygiene."""
 
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from uuid import UUID
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
@@ -18,7 +19,7 @@ from sqlalchemy import (
     Text,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -58,6 +59,15 @@ class Video(Base):
     niche_id: Mapped[int | None] = mapped_column(ForeignKey("niches.id"))
     raw_scraper_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
+    is_ad: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    has_paid_promotion_disclosure: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    session_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("scraper_sessions.id", ondelete="SET NULL"),
+    )
+
     snapshots: Mapped[list["VideoMetricsSnapshot"]] = relationship(
         back_populates="video",
         cascade="all, delete-orphan",
@@ -65,6 +75,12 @@ class Video(Base):
     )
     analysis: Mapped["VideoAnalysis | None"] = relationship(
         back_populates="video", cascade="all, delete-orphan", uselist=False
+    )
+    ad_verdict: Mapped["VideoAdVerdict | None"] = relationship(
+        back_populates="video", cascade="all, delete-orphan", uselist=False
+    )
+    session: Mapped["ScraperSession | None"] = relationship(
+        back_populates="videos", foreign_keys=[session_id]
     )
 
 
@@ -128,3 +144,39 @@ class UserVideoAnalysis(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class ScraperSession(Base):
+    __tablename__ = "scraper_sessions"
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    user_agent: Mapped[str | None] = mapped_column(Text)
+    viewport: Mapped[str | None] = mapped_column(Text)
+    videos_scraped: Mapped[int] = mapped_column(Integer, default=0)
+    ads_filtered: Mapped[int] = mapped_column(Integer, default=0)
+    unique_channels_seen: Mapped[int] = mapped_column(Integer, default=0)
+    channels_distribution: Mapped[dict | None] = mapped_column(JSONB)
+    niche_distribution: Mapped[dict | None] = mapped_column(JSONB)
+
+    videos: Mapped[list[Video]] = relationship(
+        back_populates="session", foreign_keys="Video.session_id"
+    )
+
+
+class VideoAdVerdict(Base):
+    __tablename__ = "video_ad_verdicts"
+
+    video_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("videos.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    is_ad: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reasons: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
+    classified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    video: Mapped[Video] = relationship(back_populates="ad_verdict")

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from uuid import uuid4
 
-from app.scraper_bridge import ScraperRow, iter_jsonl
+from app.scraper_bridge import AdDropRow, ScraperRow, SessionRow, iter_jsonl
 
 
 def test_scraper_row_from_dict_minimal():
@@ -75,3 +76,116 @@ def test_iter_jsonl_skips_malformed_lines(tmp_path: Path, caplog):
 
 def test_iter_jsonl_missing_file_returns_empty(tmp_path: Path):
     assert list(iter_jsonl(tmp_path / "nope.jsonl", 0)) == []
+
+
+# ---------------------------------------------------------------------------
+# Scraper hygiene fields (is_ad, session_id, disclosure)
+# ---------------------------------------------------------------------------
+
+
+def test_scraper_row_propagates_hygiene_fields():
+    sid = str(uuid4())
+    row = ScraperRow.from_dict({
+        "video_id": "abc",
+        "url": "https://www.youtube.com/shorts/abc",
+        "has_paid_promotion_disclosure": True,
+        "session_id": sid,
+    })
+    assert row.has_paid_promotion_disclosure is True
+    assert str(row.session_id) == sid
+
+
+def test_scraper_row_defaults_hygiene_fields_when_missing():
+    row = ScraperRow.from_dict({
+        "video_id": "abc",
+        "url": "https://www.youtube.com/shorts/abc",
+    })
+    assert row.has_paid_promotion_disclosure is False
+    assert row.session_id is None
+
+
+def test_scraper_row_rejects_bad_session_uuid():
+    row = ScraperRow.from_dict({
+        "video_id": "abc",
+        "url": "https://www.youtube.com/shorts/abc",
+        "session_id": "not-a-uuid",
+    })
+    assert row.session_id is None
+
+
+# ---------------------------------------------------------------------------
+# AdDropRow
+# ---------------------------------------------------------------------------
+
+
+def test_ad_drop_row_from_dict():
+    sid = str(uuid4())
+    drop = AdDropRow.from_dict({
+        "video_id": "adABC",
+        "session_id": sid,
+        "reasons": ["dom:ytd-ad-slot-renderer", "duration:over_60s"],
+    })
+    assert drop is not None
+    assert drop.video_id == "adABC"
+    assert str(drop.session_id) == sid
+    assert drop.reasons == ["dom:ytd-ad-slot-renderer", "duration:over_60s"]
+    # URL is synthesized when absent
+    assert drop.url.endswith("/shorts/adABC")
+
+
+def test_ad_drop_row_requires_video_id():
+    assert AdDropRow.from_dict({"reasons": ["x"]}) is None
+
+
+# ---------------------------------------------------------------------------
+# SessionRow
+# ---------------------------------------------------------------------------
+
+
+def test_session_row_from_dict_roundtrip():
+    sid = str(uuid4())
+    row = SessionRow.from_dict({
+        "session_id": sid,
+        "created_at": "2026-04-18T10:00:00+00:00",
+        "closed_at": "2026-04-18T11:05:00+00:00",
+        "user_agent": "UA",
+        "viewport": "1920x1080",
+        "videos_scraped": 412,
+        "ads_filtered": 67,
+        "unique_channels_seen": 238,
+        "channels_distribution": {"ChA": 10, "ChB": 5},
+    })
+    assert row is not None
+    assert str(row.session_id) == sid
+    assert row.videos_scraped == 412
+    assert row.ads_filtered == 67
+    assert row.unique_channels_seen == 238
+    assert row.channels_distribution == {"ChA": 10, "ChB": 5}
+    assert row.created_at.year == 2026
+    assert row.closed_at is not None
+
+
+def test_session_row_rejects_missing_or_bad_uuid():
+    assert SessionRow.from_dict({"created_at": "2026-04-18T00:00:00+00:00"}) is None
+    assert SessionRow.from_dict({
+        "session_id": "garbage",
+        "created_at": "2026-04-18T00:00:00+00:00",
+    }) is None
+
+
+def test_session_row_rejects_bad_timestamp():
+    assert SessionRow.from_dict({
+        "session_id": str(uuid4()),
+        "created_at": "not-a-date",
+    }) is None
+
+
+def test_session_row_handles_open_session():
+    """A session mid-rotation may be serialized without a closed_at."""
+    row = SessionRow.from_dict({
+        "session_id": str(uuid4()),
+        "created_at": "2026-04-18T10:00:00+00:00",
+        "videos_scraped": 0,
+    })
+    assert row is not None
+    assert row.closed_at is None
