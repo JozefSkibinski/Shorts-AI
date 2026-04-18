@@ -53,6 +53,8 @@ try:
 except ImportError:  # runtime check with a clear message
     yt_dlp = None  # type: ignore[assignment]
 
+import stats as stats_module
+
 
 SHORTS_URL = "https://www.youtube.com/shorts"
 MIN_VIEWS = 1_000_000
@@ -74,6 +76,7 @@ class ShortRecord:
     title: str
     description: str
     hashtags: list[str] = field(default_factory=list)
+    keywords: list[str] = field(default_factory=list)
     view_count: int = 0
     duration_seconds: float | None = None
     transcript: str | None = None
@@ -567,30 +570,32 @@ def format_duration(seconds: float | None) -> str:
     return f"{s}s" if s < 60 else f"{s // 60}m{s % 60:02d}s"
 
 
-def format_record(record: ShortRecord) -> str:
-    hashtags = " ".join(record.hashtags) if record.hashtags else "(none)"
-    no_text = "(no transcript available)"
-    hook = record.hook or no_text
-    transcript = record.transcript or no_text
-    description = record.description.strip() or "(empty)"
+def _compact(text: str) -> str:
+    """Collapse whitespace so transcripts fit on a single line."""
+    return re.sub(r"\s+", " ", text).strip()
 
-    return (
-        "=" * 72 + "\n"
-        f"Video: {record.title or '(no title)'}\n"
-        f"Channel: {record.channel or '(unknown)'}\n"
-        f"Views: {record.view_count:,}\n"
-        f"Length: {format_duration(record.duration_seconds)}\n"
-        f"Link: {record.url}\n"
-        f"Hashtags: {hashtags}\n"
-        f"Metadata source: {record.metadata_source or '(unknown)'}\n"
-        f"Transcript source: {record.transcript_source}\n"
-        "--- Description ---\n"
-        f"{description}\n"
-        f"--- Hook (first {int(HOOK_SECONDS)}s) ---\n"
-        f"{hook}\n"
-        "--- Transcript ---\n"
-        f"{transcript}\n"
+
+def format_record(record: ShortRecord) -> str:
+    """Compact one-block-per-Short format. Empty fields are omitted."""
+    parts: list[str] = []
+    parts.append(
+        f"[{record.view_count:,}v {format_duration(record.duration_seconds)}] "
+        f"{record.channel or '?'} | {record.title or '?'}"
     )
+    parts.append(f"  url:  {record.url}")
+    if record.hashtags:
+        parts.append(f"  tags: {' '.join(record.hashtags)}")
+    src = f"{record.metadata_source or '?'} / {record.transcript_source}"
+    parts.append(f"  src:  {src}")
+    desc = _compact(record.description)
+    if desc:
+        parts.append(f"  desc: {desc}")
+    if record.hook:
+        parts.append(f"  hook: {_compact(record.hook)}")
+    if record.transcript and record.transcript != record.hook:
+        parts.append(f"  text: {_compact(record.transcript)}")
+    parts.append("--")
+    return "\n".join(parts) + "\n"
 
 
 def append_record(data_path: Path, jsonl_path: Path, record: ShortRecord) -> None:
@@ -790,6 +795,7 @@ def scrape(
                 title=title,
                 description=description,
                 hashtags=hashtags,
+                keywords=list(keywords),
                 view_count=views,
                 duration_seconds=duration,
                 transcript=transcript,
@@ -816,12 +822,16 @@ def scrape(
     append_summary(
         data_path, scanned, kept, skipped_ads, channel_counts, transcript_counts
     )
+    stats_path = output_dir / "stats.txt"
+    n_total = stats_module.write_report(jsonl_path, stats_path)
     log.info(
-        "Done. Scanned %d, kept %d, ads skipped %d. Output: %s",
+        "Done. Scanned %d, kept %d, ads skipped %d. Output: %s (stats: %s, %d rows)",
         scanned,
         kept,
         skipped_ads,
         data_path,
+        stats_path,
+        n_total,
     )
 
 
@@ -844,6 +854,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Disable Whisper fallback; use captions only.",
     )
     parser.set_defaults(whisper_enabled=True)
+    parser.add_argument(
+        "--stats-only",
+        action="store_true",
+        help="Skip scraping; recompute stats.txt from existing shorts.jsonl.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args(argv)
 
@@ -855,6 +870,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
+    if args.stats_only:
+        jsonl_path = args.output_dir / "shorts.jsonl"
+        stats_path = args.output_dir / "stats.txt"
+        n = stats_module.write_report(jsonl_path, stats_path)
+        log.info("Wrote %s (%d records)", stats_path, n)
+        return 0
+
     whisper_model = args.whisper_model if args.whisper_enabled else None
     try:
         scrape(

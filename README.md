@@ -37,11 +37,46 @@ python main.py --min-views 500000
 
 Output goes to:
 
-- `output/data.txt` — human-readable blocks, one per qualifying Short
-- `output/shorts.jsonl` — same data as structured JSON per line
+- `output/data.txt` — compact one-block-per-Short log
+- `output/shorts.jsonl` — structured JSON per line (machine-readable mirror)
+- `output/stats.txt` — ranked statistics, regenerated at end of every run
 
-Both files are append-only — you can kill the run at any time without
-losing progress.
+`data.txt` and `shorts.jsonl` are append-only, so you can kill a run
+at any time without losing progress. Re-running the scraper auto-skips
+Shorts that are already in `shorts.jsonl`.
+
+Each `data.txt` block looks like:
+
+```
+[12,345,678v 38s] Channel Name | Title of the Short
+  url:  https://www.youtube.com/shorts/<id>
+  tags: #viral #funny
+  src:  yt-dlp / captions
+  desc: short description
+  hook: first seven seconds of speech
+  text: full transcript on one line
+--
+```
+
+Empty fields (no description, no hook, etc.) are omitted to keep the
+file small.
+
+## Statistics
+
+`output/stats.txt` ranks the dataset to surface what performs best.
+Sections:
+
+- Top hashtags by total views and by avg views (min 3 videos)
+- Top yt-dlp keyword tags by total views
+- Top channels by total and avg views
+- Duration buckets (which lengths perform best)
+- Hook vocabulary by avg views — which words show up in the best hooks
+
+Recompute against an existing `shorts.jsonl` without scraping:
+
+```bash
+python main.py --stats-only
+```
 
 ## How view counts are resolved
 
