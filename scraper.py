@@ -519,9 +519,40 @@ def current_video_id(page: Page) -> str | None:
     return vid
 
 
-def advance(page: Page) -> None:
-    page.keyboard.press("ArrowDown")
-    page.wait_for_timeout(random.randint(1500, 2800))
+def is_current_ad(page: Page) -> bool:
+    """Return True if the currently visible Short appears to be an ad."""
+    try:
+        return bool(
+            page.evaluate(
+                """() => {
+                    const a = document.querySelector('ytd-reel-video-renderer[is-active]');
+                    if (!a) return false;
+                    if (a.querySelector('ytd-ad-slot-renderer, .ytp-ad-player-overlay-layout, .ytp-ad-text')) return true;
+                    const badge = a.querySelector('[class*="badge-shape"], .ytd-badge-supported-renderer');
+                    if (badge && /sponsored|ad/i.test(badge.innerText || '')) return true;
+                    return false;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def advance(page: Page, previous_id: str | None) -> str | None:
+    """Scroll to the next Short. Retries if the page doesn't move."""
+    for attempt in range(4):
+        page.keyboard.press("ArrowDown")
+        page.wait_for_timeout(random.randint(1500, 2800))
+        new_id = current_video_id(page)
+        if new_id and new_id != previous_id:
+            return new_id
+        # stronger nudge: wheel the viewport
+        try:
+            page.mouse.wheel(0, 900)
+        except Exception:
+            pass
+        page.wait_for_timeout(700)
+    return current_video_id(page)
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +601,65 @@ def append_record(data_path: Path, jsonl_path: Path, record: ShortRecord) -> Non
         f.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
 
 
+def load_previous_ids(jsonl_path: Path) -> set[str]:
+    """Read any existing jsonl file so previously-saved Shorts are skipped."""
+    if not jsonl_path.exists():
+        return set()
+    ids: set[str] = set()
+    with jsonl_path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            vid = row.get("video_id")
+            if vid:
+                ids.add(vid)
+    return ids
+
+
+def append_summary(
+    data_path: Path,
+    scanned: int,
+    kept: int,
+    skipped_ads: int,
+    channel_counts: dict[str, int],
+    transcript_counts: dict[str, int],
+) -> None:
+    top_channels = sorted(channel_counts.items(), key=lambda kv: -kv[1])[:10]
+    lines = [
+        "",
+        "#" * 72,
+        "# RUN SUMMARY",
+        "#" * 72,
+        f"Scanned: {scanned}",
+        f"Saved:   {kept}",
+        f"Skipped ads: {skipped_ads}",
+        f"Transcript sources: "
+        + ", ".join(f"{k}={v}" for k, v in transcript_counts.items())
+        if transcript_counts
+        else "Transcript sources: (none)",
+        "Top channels:",
+    ]
+    if top_channels:
+        for ch, n in top_channels:
+            lines.append(f"  {n:3d}  {ch}")
+    else:
+        lines.append("  (none)")
+    lines.append("")
+    with data_path.open("a", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def check_ffmpeg_available() -> bool:
+    import shutil
+
+    return shutil.which("ffmpeg") is not None
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -587,16 +677,27 @@ def scrape(
             "yt-dlp is not installed — view counts will rely on fallbacks only. "
             "Install with: pip install yt-dlp"
         )
+    if whisper_model and not check_ffmpeg_available():
+        log.warning(
+            "ffmpeg was not found on PATH. Whisper needs it to decode audio; "
+            "transcripts will fall back to '(none)' for Shorts without captions."
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     data_path = output_dir / "data.txt"
     jsonl_path = output_dir / "shorts.jsonl"
 
     store = MetadataStore()
-    seen_ids: set[str] = set()
+    resumed_ids = load_previous_ids(jsonl_path)
+    if resumed_ids:
+        log.info("Resume: %d Shorts already recorded, will skip them.", len(resumed_ids))
+    seen_ids: set[str] = set(resumed_ids)
     kept = 0
     scanned = 0
+    skipped_ads = 0
     empty_streak = 0
+    channel_counts: dict[str, int] = {}
+    transcript_counts: dict[str, int] = {}
 
     with sync_playwright() as pw:
         browser: Browser = pw.chromium.launch(
@@ -626,6 +727,7 @@ def scrape(
 
         page.wait_for_timeout(2500)
 
+        last_id: str | None = None
         while scanned < max_videos:
             page.wait_for_timeout(800)
             video_id = current_video_id(page)
@@ -634,12 +736,18 @@ def scrape(
                 if empty_streak > 5:
                     log.warning("Too many empty reads, stopping")
                     break
-                advance(page)
+                last_id = advance(page, last_id)
                 continue
             empty_streak = 0
 
+            if is_current_ad(page):
+                skipped_ads += 1
+                log.info("skipped ad")
+                last_id = advance(page, video_id)
+                continue
+
             if video_id in seen_ids:
-                advance(page)
+                last_id = advance(page, video_id)
                 continue
             seen_ids.add(video_id)
             scanned += 1
@@ -666,7 +774,7 @@ def scrape(
             )
 
             if views < min_views:
-                advance(page)
+                last_id = advance(page, video_id)
                 continue
 
             transcript, hook, t_source = fetch_transcript(video_id, whisper_model)
@@ -691,6 +799,9 @@ def scrape(
             )
             append_record(data_path, jsonl_path, record)
             kept += 1
+            if channel:
+                channel_counts[channel] = channel_counts.get(channel, 0) + 1
+            transcript_counts[t_source] = transcript_counts.get(t_source, 0) + 1
             log.info(
                 "  -> saved (%d total >= %d views, transcript=%s)",
                 kept,
@@ -698,11 +809,20 @@ def scrape(
                 t_source,
             )
 
-            advance(page)
+            last_id = advance(page, video_id)
 
         browser.close()
 
-    log.info("Done. Scanned %d, kept %d. Output: %s", scanned, kept, data_path)
+    append_summary(
+        data_path, scanned, kept, skipped_ads, channel_counts, transcript_counts
+    )
+    log.info(
+        "Done. Scanned %d, kept %d, ads skipped %d. Output: %s",
+        scanned,
+        kept,
+        skipped_ads,
+        data_path,
+    )
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
