@@ -1,23 +1,33 @@
 """YouTube Shorts scraper.
 
 Opens YouTube Shorts in an incognito Playwright context so browsing does not
-influence the logged-in algorithm, auto-scrolls through videos, and records
-metadata for every Short with more than 1,000,000 views.
+influence any logged-in algorithm, auto-scrolls the feed to collect Short
+video IDs, and for every Short with at least ``--min-views`` views writes a
+human-readable record to ``data.txt``.
 
-View count, title, author, length and description come from the internal
-``/youtubei/v1/player`` responses that YouTube fires for each Short as it
-loads, which is far more reliable than scraping the rendered DOM.
+Metadata resolution uses three sources in order, so at least one should
+always produce an exact ``view_count``:
+
+    1. ``yt-dlp`` extract_info for the video URL (most reliable)
+    2. the ``ytInitialPlayerResponse`` embedded in the Short's HTML page
+       (fetched via the same incognito context)
+    3. ``/youtubei/v1/player`` responses captured by a Playwright response
+       listener while scrolling
+
+If all three disagree, yt-dlp wins. If all three return 0, the Short is
+logged anyway with ``view_count: 0`` and a clear note so the problem is
+visible rather than silent.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import logging
 import random
 import re
 import sys
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -37,6 +47,11 @@ from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     VideoUnavailable,
 )
+
+try:
+    import yt_dlp
+except ImportError:  # runtime check with a clear message
+    yt_dlp = None  # type: ignore[assignment]
 
 
 SHORTS_URL = "https://www.youtube.com/shorts"
@@ -63,6 +78,7 @@ class ShortRecord:
     duration_seconds: float | None = None
     transcript: str | None = None
     hook: str | None = None
+    metadata_source: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +111,6 @@ def extract_video_id(url: str) -> str | None:
 
 
 def fetch_transcript(video_id: str) -> tuple[str | None, str | None]:
-    """Return (full_transcript, hook) or (None, None) if unavailable."""
     try:
         snippets = YouTubeTranscriptApi.get_transcript(
             video_id, languages=["en", "en-US", "en-GB"]
@@ -117,80 +132,62 @@ def fetch_transcript(video_id: str) -> tuple[str | None, str | None]:
 
 
 # ---------------------------------------------------------------------------
-# Network interception
+# Source 1: yt-dlp (primary)
 # ---------------------------------------------------------------------------
 
 
-class MetadataStore:
-    """Thread-safe map of video_id -> metadata dict captured from /player."""
+def fetch_metadata_ytdlp(video_id: str) -> dict | None:
+    if yt_dlp is None:
+        return None
 
-    def __init__(self) -> None:
-        self._data: dict[str, dict] = {}
-        self._lock = Lock()
-
-    def update(self, video_id: str, fields: dict) -> None:
-        with self._lock:
-            existing = self._data.setdefault(video_id, {})
-            for k, v in fields.items():
-                if v is not None and v != "":
-                    existing[k] = v
-
-    def get(self, video_id: str) -> dict | None:
-        with self._lock:
-            return dict(self._data.get(video_id) or {}) or None
-
-
-def _parse_player_payload(payload: dict) -> tuple[str | None, dict]:
-    details = payload.get("videoDetails") or {}
-    vid = details.get("videoId")
-    if not vid:
-        return None, {}
-
-    try:
-        views = int(details.get("viewCount") or 0)
-    except (TypeError, ValueError):
-        views = 0
-    try:
-        duration = float(details.get("lengthSeconds") or 0) or None
-    except (TypeError, ValueError):
-        duration = None
-
-    keywords = details.get("keywords") or []
-    fields = {
-        "title": (details.get("title") or "").strip(),
-        "channel": (details.get("author") or "").strip(),
-        "description": (details.get("shortDescription") or "").strip(),
-        "view_count": views,
-        "duration_seconds": duration,
-        "keywords": list(keywords),
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": False,
+        "socket_timeout": 20,
     }
-    return vid, fields
+    url = f"https://www.youtube.com/shorts/{video_id}"
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:
+        log.debug("yt-dlp failed for %s: %s", video_id, exc)
+        return None
 
+    if not info:
+        return None
 
-def install_player_interceptor(context: BrowserContext, store: MetadataStore) -> None:
-    def handle(response: Response) -> None:
-        url = response.url
-        if "/youtubei/v1/player" not in url:
-            return
-        try:
-            data = response.json()
-        except Exception:
-            return
-        vid, fields = _parse_player_payload(data)
-        if vid and fields:
-            store.update(vid, fields)
-            log.debug("captured %s: %s views", vid, fields.get("view_count"))
+    views = info.get("view_count")
+    try:
+        views_int = int(views) if views is not None else 0
+    except (TypeError, ValueError):
+        views_int = 0
 
-    context.on("response", handle)
+    duration = info.get("duration")
+    try:
+        duration_sec = float(duration) if duration is not None else None
+    except (TypeError, ValueError):
+        duration_sec = None
+
+    tags = info.get("tags") or []
+    return {
+        "title": (info.get("title") or "").strip(),
+        "channel": (info.get("channel") or info.get("uploader") or "").strip(),
+        "description": (info.get("description") or "").strip(),
+        "view_count": views_int,
+        "duration_seconds": duration_sec,
+        "keywords": list(tags),
+        "source": "yt-dlp",
+    }
 
 
 # ---------------------------------------------------------------------------
-# HTTP fallback: fetch the Short's page and parse ytInitialPlayerResponse
+# Source 2: HTML page ytInitialPlayerResponse (fallback)
 # ---------------------------------------------------------------------------
 
 
 def _balanced_json(text: str, start: int) -> str | None:
-    """Return the JSON object starting at index `start` (must be a '{')."""
     depth = 0
     in_string = False
     escape = False
@@ -216,9 +213,28 @@ def _balanced_json(text: str, start: int) -> str | None:
     return None
 
 
+def _parse_player_payload(payload: dict) -> dict:
+    details = payload.get("videoDetails") or {}
+    try:
+        views = int(details.get("viewCount") or 0)
+    except (TypeError, ValueError):
+        views = 0
+    try:
+        duration = float(details.get("lengthSeconds") or 0) or None
+    except (TypeError, ValueError):
+        duration = None
+    return {
+        "title": (details.get("title") or "").strip(),
+        "channel": (details.get("author") or "").strip(),
+        "description": (details.get("shortDescription") or "").strip(),
+        "view_count": views,
+        "duration_seconds": duration,
+        "keywords": list(details.get("keywords") or []),
+    }
+
+
 def parse_initial_player_response(html: str) -> dict | None:
-    marker = "ytInitialPlayerResponse"
-    idx = html.find(marker)
+    idx = html.find("ytInitialPlayerResponse")
     if idx == -1:
         return None
     brace = html.find("{", idx)
@@ -233,33 +249,111 @@ def parse_initial_player_response(html: str) -> dict | None:
         return None
 
 
-def fetch_metadata_http(context: BrowserContext, video_id: str) -> dict | None:
-    """Fetch the Short's HTML page via the incognito context and parse metadata."""
-    url = f"https://www.youtube.com/shorts/{video_id}"
-    try:
-        resp = context.request.get(
-            url,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept": "text/html,application/xhtml+xml",
-            },
-            timeout=15_000,
-        )
-        if not resp.ok:
-            log.debug("HTTP %s for %s", resp.status, video_id)
-            return None
-        html = resp.text()
-    except Exception as exc:
-        log.debug("HTTP fetch failed for %s: %s", video_id, exc)
-        return None
+def fetch_metadata_html(context: BrowserContext, video_id: str) -> dict | None:
+    for path in (f"/shorts/{video_id}", f"/watch?v={video_id}"):
+        url = f"https://www.youtube.com{path}"
+        try:
+            resp = context.request.get(
+                url,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml",
+                },
+                timeout=15_000,
+            )
+            if not resp.ok:
+                continue
+            html = resp.text()
+        except Exception as exc:
+            log.debug("HTML fetch failed for %s: %s", url, exc)
+            continue
+        payload = parse_initial_player_response(html)
+        if not payload:
+            continue
+        fields = _parse_player_payload(payload)
+        if fields.get("view_count"):
+            fields["source"] = f"html:{path}"
+            return fields
+    return None
 
-    payload = parse_initial_player_response(html)
-    if not payload:
-        log.debug("no ytInitialPlayerResponse for %s", video_id)
-        return None
-    _, fields = _parse_player_payload(payload)
-    return fields or None
+
+# ---------------------------------------------------------------------------
+# Source 3: /youtubei/v1/player response interceptor
+# ---------------------------------------------------------------------------
+
+
+class MetadataStore:
+    def __init__(self) -> None:
+        self._data: dict[str, dict] = {}
+        self._lock = Lock()
+
+    def update(self, video_id: str, fields: dict) -> None:
+        with self._lock:
+            existing = self._data.setdefault(video_id, {})
+            for k, v in fields.items():
+                if v not in (None, "", 0) or k not in existing:
+                    existing[k] = v
+
+    def get(self, video_id: str) -> dict | None:
+        with self._lock:
+            return dict(self._data.get(video_id) or {}) or None
+
+
+def install_player_interceptor(context: BrowserContext, store: MetadataStore) -> None:
+    def handle(response: Response) -> None:
+        if "/youtubei/v1/player" not in response.url:
+            return
+        try:
+            data = response.json()
+        except Exception:
+            return
+        details = (data or {}).get("videoDetails") or {}
+        vid = details.get("videoId")
+        if not vid:
+            return
+        fields = _parse_player_payload(data)
+        fields["source"] = "interceptor"
+        store.update(vid, fields)
+        log.debug("intercepted %s views=%s", vid, fields.get("view_count"))
+
+    context.on("response", handle)
+
+
+# ---------------------------------------------------------------------------
+# Metadata resolver
+# ---------------------------------------------------------------------------
+
+
+def resolve_metadata(
+    context: BrowserContext, store: MetadataStore, video_id: str
+) -> dict:
+    """Try every source; return the best result we can get."""
+    # 1. yt-dlp (most reliable, exact integer view_count)
+    meta = fetch_metadata_ytdlp(video_id)
+    if meta and meta.get("view_count"):
+        return meta
+    best = meta or {}
+
+    # 2. HTML page parse
+    html_meta = fetch_metadata_html(context, video_id)
+    if html_meta and html_meta.get("view_count"):
+        return html_meta
+    if html_meta and not best:
+        best = html_meta
+
+    # 3. Interceptor store
+    intercepted = store.get(video_id)
+    if intercepted and intercepted.get("view_count"):
+        intercepted["source"] = intercepted.get("source", "interceptor")
+        return intercepted
+    if intercepted and not best:
+        intercepted["source"] = intercepted.get("source", "interceptor")
+        best = intercepted
+
+    if not best:
+        best = {"source": "none", "view_count": 0}
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +383,6 @@ def dismiss_consent(page: Page) -> None:
 
 
 def current_video_id(page: Page) -> str | None:
-    """Read the currently visible Short's video id from the URL or DOM."""
     try:
         href = page.evaluate("() => location.href")
     except Exception:
@@ -302,44 +395,12 @@ def current_video_id(page: Page) -> str | None:
             """() => {
                 const a = document.querySelector('ytd-reel-video-renderer[is-active]');
                 if (!a) return null;
-                const id = a.getAttribute('video-id') || a.id;
-                return id || null;
+                return a.getAttribute('video-id') || a.id || null;
             }"""
         )
     except Exception:
         vid = None
     return vid
-
-
-def wait_for_metadata(
-    context: BrowserContext,
-    store: MetadataStore,
-    video_id: str,
-    timeout_ms: int = 4000,
-) -> dict | None:
-    """Return metadata for video_id.
-
-    Waits briefly for the /player response interceptor to populate the store,
-    then falls back to fetching the Short's HTML page over HTTP and parsing
-    ``ytInitialPlayerResponse``. The HTTP path is the reliable one — the
-    interceptor is just an optimisation when it happens to fire.
-    """
-    import time as _t
-
-    waited = 0
-    step = 250
-    while waited < timeout_ms:
-        meta = store.get(video_id)
-        if meta and meta.get("view_count"):
-            return meta
-        _t.sleep(step / 1000.0)
-        waited += step
-
-    fields = fetch_metadata_http(context, video_id)
-    if fields:
-        store.update(video_id, fields)
-        return store.get(video_id)
-    return store.get(video_id)
 
 
 def advance(page: Page) -> None:
@@ -351,30 +412,42 @@ def advance(page: Page) -> None:
 # Output
 # ---------------------------------------------------------------------------
 
-CSV_FIELDS = [
-    "video_id",
-    "url",
-    "channel",
-    "title",
-    "view_count",
-    "duration_seconds",
-    "hashtags",
-    "description",
-    "hook",
-    "transcript",
-]
+
+def format_duration(seconds: float | None) -> str:
+    if not seconds:
+        return "unknown"
+    s = int(round(seconds))
+    return f"{s}s" if s < 60 else f"{s // 60}m{s % 60:02d}s"
 
 
-def append_row(csv_path: Path, jsonl_path: Path, record: ShortRecord) -> None:
-    is_new = not csv_path.exists()
-    with csv_path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        if is_new:
-            writer.writeheader()
-        row = asdict(record)
-        row["hashtags"] = " ".join(record.hashtags)
-        writer.writerow(row)
+def format_record(record: ShortRecord) -> str:
+    hashtags = " ".join(record.hashtags) if record.hashtags else "(none)"
+    hook = record.hook or "(no captions)"
+    transcript = record.transcript or "(no captions)"
+    description = record.description.strip() or "(empty)"
 
+    return (
+        "=" * 72 + "\n"
+        f"Video: {record.title or '(no title)'}\n"
+        f"Channel: {record.channel or '(unknown)'}\n"
+        f"Views: {record.view_count:,}\n"
+        f"Length: {format_duration(record.duration_seconds)}\n"
+        f"Link: {record.url}\n"
+        f"Hashtags: {hashtags}\n"
+        f"Source: {record.metadata_source or '(unknown)'}\n"
+        "--- Description ---\n"
+        f"{description}\n"
+        "--- Hook (first 7s) ---\n"
+        f"{hook}\n"
+        "--- Transcript ---\n"
+        f"{transcript}\n"
+    )
+
+
+def append_record(data_path: Path, jsonl_path: Path, record: ShortRecord) -> None:
+    with data_path.open("a", encoding="utf-8") as f:
+        f.write(format_record(record))
+        f.write("\n")
     with jsonl_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
 
@@ -390,8 +463,14 @@ def scrape(
     headless: bool,
     min_views: int,
 ) -> None:
+    if yt_dlp is None:
+        log.warning(
+            "yt-dlp is not installed — view counts will rely on fallbacks only. "
+            "Install with: pip install yt-dlp"
+        )
+
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "shorts.csv"
+    data_path = output_dir / "data.txt"
     jsonl_path = output_dir / "shorts.jsonl"
 
     store = MetadataStore()
@@ -415,7 +494,7 @@ def scrape(
         install_player_interceptor(context, store)
 
         page = context.new_page()
-        log.info("Opening %s", SHORTS_URL)
+        log.info("Opening %s (incognito)", SHORTS_URL)
         page.goto(SHORTS_URL, wait_until="domcontentloaded", timeout=60_000)
         dismiss_consent(page)
 
@@ -446,20 +525,25 @@ def scrape(
             seen_ids.add(video_id)
             scanned += 1
 
-            meta = wait_for_metadata(context, store, video_id, timeout_ms=4000) or {}
+            # Give the interceptor a moment to catch this video's /player call
+            time.sleep(0.5)
+            meta = resolve_metadata(context, store, video_id)
+
             views = int(meta.get("view_count") or 0)
             title = meta.get("title") or ""
             channel = meta.get("channel") or ""
             description = meta.get("description") or ""
             keywords = meta.get("keywords") or []
             duration = meta.get("duration_seconds")
+            source = meta.get("source") or "none"
 
             log.info(
-                "[%d] %s | %s | %s views",
+                "[%d] %s | %s | %s views (src=%s)",
                 scanned,
-                channel or "?",
-                title[:60] or "?",
+                (channel or "?")[:30],
+                (title or "?")[:50],
                 f"{views:,}",
+                source,
             )
 
             if views < min_views:
@@ -483,46 +567,26 @@ def scrape(
                 duration_seconds=duration,
                 transcript=transcript,
                 hook=hook,
+                metadata_source=source,
             )
-            append_row(csv_path, jsonl_path, record)
+            append_record(data_path, jsonl_path, record)
             kept += 1
-            log.info("  -> kept (%d total >= %d views)", kept, min_views)
+            log.info("  -> saved (%d total >= %d views)", kept, min_views)
 
             advance(page)
 
         browser.close()
 
-    log.info("Done. Scanned %d, kept %d. Output: %s", scanned, kept, output_dir)
+    log.info("Done. Scanned %d, kept %d. Output: %s", scanned, kept, data_path)
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Scrape popular YouTube Shorts.")
-    parser.add_argument(
-        "--max-videos",
-        type=int,
-        default=500,
-        help="How many unique Shorts to scan before stopping (default 500).",
-    )
-    parser.add_argument(
-        "--min-views",
-        type=int,
-        default=MIN_VIEWS,
-        help="Only log Shorts with at least this many views (default 1,000,000).",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("output"),
-        help="Directory to write shorts.csv / shorts.jsonl (default ./output).",
-    )
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run Chromium without a visible window.",
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", help="Verbose logging."
-    )
+    parser.add_argument("--max-videos", type=int, default=500)
+    parser.add_argument("--min-views", type=int, default=MIN_VIEWS)
+    parser.add_argument("--output-dir", type=Path, default=Path("output"))
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args(argv)
 
 

@@ -8,12 +8,12 @@ For each qualifying Short (default: **>= 1,000,000 views**) it records:
 
 - channel name
 - title
-- hashtags (parsed from title + description)
+- hashtags (parsed from title, description, and tags)
 - description / caption
-- video length (seconds)
+- video length
 - direct link (`https://www.youtube.com/shorts/<id>`)
 - full transcript (when captions are available)
-- hook (the first ~7 seconds of the transcript)
+- hook — the first ~7 seconds of the transcript
 
 ## Install
 
@@ -35,21 +35,35 @@ python main.py --headless --max-videos 2000 --output-dir data/
 python main.py --min-views 500000
 ```
 
-Results are streamed to:
+Output goes to:
 
-- `output/shorts.csv`  — one row per qualifying Short
-- `output/shorts.jsonl` — same data, JSON per line (keeps list fields intact)
+- `output/data.txt` — human-readable blocks, one per qualifying Short
+- `output/shorts.jsonl` — same data as structured JSON per line
 
-Rows are appended as they are found, so you can kill the run at any time
-without losing progress.
+Both files are append-only — you can kill the run at any time without
+losing progress.
+
+## How view counts are resolved
+
+The browser is used only for **incognito scroll discovery**. For each
+Short the ID is then resolved through three independent sources, first
+match wins:
+
+1. **yt-dlp** — `extract_info` returns the exact integer `view_count`.
+2. **HTML parse** — fetch `/shorts/<id>` (and `/watch?v=<id>` as backup)
+   and extract `videoDetails.viewCount` from `ytInitialPlayerResponse`.
+3. **Response interceptor** — any `/youtubei/v1/player` response caught
+   while the feed is playing.
+
+The `Source:` line in each `data.txt` block tells you which source
+produced that record, so if views look wrong you know where to look.
 
 ## Notes
 
 - The browser launches with `--incognito` and a fresh context with no
   `storage_state`, so no cookies or history follow between runs.
-- Scrolling uses `ArrowDown`, which YouTube treats as "next Short". Random
-  1.5–2.8s delays are used between advances to mimic human pacing.
-- Transcripts come from `youtube-transcript-api` (no API key needed). Shorts
-  without captions simply get `transcript: null`.
-- View counts are parsed from the visible label (e.g. `1.2M views`), so the
-  threshold is approximate by ~1% at the boundary.
+- Scrolling uses `ArrowDown`, which YouTube treats as "next Short".
+  Random 1.5–2.8s delays between advances mimic human pacing.
+- Transcripts come from `youtube-transcript-api` (no API key needed).
+  Shorts without captions record `(no captions)` in the hook/transcript
+  fields.
