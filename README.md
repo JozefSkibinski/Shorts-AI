@@ -1,5 +1,98 @@
 # Shorts-AI
 
+This repo contains two things:
+
+1. **The scraper** (top-level `scraper.py` / `main.py`) — already shipped.
+   Opens YouTube Shorts in an incognito Playwright context and logs every
+   Short above a view threshold to `output/shorts.jsonl` + `output/data.txt`
+   + `output/stats.txt`.
+2. **`shorts_ai/`** — the RAG + tool-use agent being built on top of that
+   corpus per `MVP Build Spec`. Phase 1 (data foundation) lives there.
+
+---
+
+## Pre-Phase-1 answers (what the scraper actually emits)
+
+The MVP spec asks four scoping questions before any new code is written.
+Answering them up front so Phase 1 lines up with reality.
+
+### 1. What does the existing scraper emit?
+
+- **`output/shorts.jsonl`** — one JSON object per line, append-only. This
+  is the structured source of truth the bridge ingests. Schema (matches
+  the `ShortRecord` dataclass in `scraper.py`):
+
+  ```json
+  {
+    "video_id":          "abc123XYZ_-",
+    "url":               "https://www.youtube.com/shorts/<id>",
+    "channel":           "Channel Name",
+    "title":             "Short title",
+    "description":       "caption text...",
+    "hashtags":          ["#viral", "#funny"],
+    "keywords":          ["viral", "funny", "..."],
+    "view_count":        12345678,
+    "duration_seconds":  38.0,
+    "transcript":        "full transcript text or null",
+    "hook":              "first ~7s of speech or null",
+    "metadata_source":   "yt-dlp | html:/shorts/... | interceptor | none",
+    "transcript_source": "captions | whisper | none"
+  }
+  ```
+
+- **`output/data.txt`** — compact human-readable mirror of the same data.
+  Not used by the bridge; for human eyeballing only.
+- **`output/stats.txt`** — ranked aggregates regenerated at end of every
+  scrape. Reference for what "performance" looks like before any ML.
+- **Update cadence**: append-only as the scraper scrolls. Re-running the
+  scraper resumes from `shorts.jsonl` and only adds new IDs. No deletes,
+  no in-place updates.
+
+### 2. Is there video file storage, or only metadata?
+
+Only metadata. The scraper never downloads the video file — it pulls
+metadata via yt-dlp's `extract_info(download=False)` and pulls audio
+only when transcribing a missing-caption Short (and deletes it
+immediately after Whisper runs).
+
+**Implication for Phase 1**: the enrichment pipeline must download
+the video itself (yt-dlp) when it needs visual embeddings or audio
+fingerprints. We do this on-demand per video and clean up afterwards;
+no persistent media store in MVP.
+
+### 3. Niche coverage of the corpus
+
+Untyped today — niches are not classified at scrape time. Whatever
+surfaces in the YouTube Shorts feed during a run gets logged. So the
+corpus is whatever Shorts the algorithm serves to a fresh signed-out
+session, weighted by current popularity.
+
+**Implication for Phase 1**: every video gets niche-classified by the
+enrichment pipeline (single Haiku call on title + transcript +
+hashtags against the 20-slug taxonomy). Coverage of the 20 starter
+slugs will be uneven; we expect a long tail and `other` will be
+common until the corpus grows.
+
+### 4. GPU available for Whisper / CLIP?
+
+Assume **CPU only** as the default deployment target. The scraper
+already runs `faster-whisper` `tiny` on CPU at ~1–3s per Short and
+that's acceptable for the enrichment throughput we need.
+
+For Phase 1:
+
+- Whisper: `faster-whisper` with `small.en` on CPU (int8). Spec says
+  `WHISPER_MODEL=small.en` is the default, override to `medium.en` via
+  env var when a GPU is available.
+- CLIP: `open_clip` `ViT-B-32` runs on CPU but slow (~1–2s per frame).
+  We'll embed only 3 frames per Short (first, +3s, midpoint).
+- Anything heavier than that goes through API alternatives later (e.g.
+  Voyage embeddings) — not in the MVP.
+
+---
+
+## The scraper (existing)
+
 Automated YouTube Shorts scraper. Opens `youtube.com/shorts` in an incognito
 Playwright context (no cookies, no account, no algorithm pollution),
 auto-scrolls through the feed, and logs every Short over a view threshold.
