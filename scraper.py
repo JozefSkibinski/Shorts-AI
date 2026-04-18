@@ -711,6 +711,7 @@ def scrape(
     headless: bool,
     min_views: int,
     whisper_model: str | None,
+    max_short_duration: float = ad_filter.MAX_SHORT_DURATION_SECONDS_DEFAULT,
 ) -> None:
     if yt_dlp is None:
         log.warning(
@@ -821,7 +822,9 @@ def scrape(
                 time.sleep(0.5)
                 meta = resolve_metadata(context_for_session(sessions), store, video_id)
 
-                verdict = ad_filter.classify(page, meta)
+                verdict = ad_filter.classify(
+                    page, meta, max_short_duration=max_short_duration
+                )
                 if verdict.is_ad:
                     skipped_ads += 1
                     sessions.record_ad()
@@ -958,6 +961,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Scrape popular YouTube Shorts.")
     parser.add_argument("--max-videos", type=int, default=500)
     parser.add_argument("--min-views", type=int, default=MIN_VIEWS)
+    parser.add_argument(
+        "--max-short-duration",
+        type=float,
+        default=ad_filter.MAX_SHORT_DURATION_SECONDS_DEFAULT,
+        help="Videos longer than this (seconds) are treated as promoted "
+        "long-form and dropped. Default matches YouTube's current 180s "
+        "Shorts cap; raise to disable, lower to be stricter.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("output"))
     parser.add_argument("--headless", action="store_true")
     parser.add_argument(
@@ -1004,6 +1015,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             headless=args.headless,
             min_views=args.min_views,
             whisper_model=whisper_model,
+            max_short_duration=args.max_short_duration,
         )
     except KeyboardInterrupt:
         log.info("Interrupted by user")

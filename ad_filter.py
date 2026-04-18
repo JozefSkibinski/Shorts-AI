@@ -43,6 +43,13 @@ DISCLOSURE_TOKENS: tuple[str, ...] = ("includes paid promotion",)
 # URL substrings that only appear on ad endpoints.
 AD_URL_SUBSTRINGS: tuple[str, ...] = ("&ad_type=", "/pagead/")
 
+# Max legitimate Short duration. YouTube raised the Shorts cap from 60s to
+# 180s in October 2024, so the old "over 60s = promoted long-form" rule is
+# no longer a useful signal on its own. We keep a duration check but put
+# the threshold above the current Shorts maximum; anything above 180s is
+# still a strong "this doesn't belong in the Shorts feed" signal.
+MAX_SHORT_DURATION_SECONDS_DEFAULT: float = 180.0
+
 
 @dataclass
 class AdVerdict:
@@ -81,14 +88,23 @@ def _probe_active_reel(page: Page) -> dict:
         return {"hits": [], "text": "", "href": ""}
 
 
-def classify(page: Page, meta: dict[str, Any] | None) -> AdVerdict:
+def classify(
+    page: Page,
+    meta: dict[str, Any] | None,
+    *,
+    max_short_duration: float = MAX_SHORT_DURATION_SECONDS_DEFAULT,
+) -> AdVerdict:
     """Classify the currently-visible Short.
 
     ``meta`` is whatever the scraper has already resolved for this video
     (yt-dlp / html / interceptor output). Extra fields the player
-    interceptor now captures — ``ad_placements``, ``is_ad_flag`` — are
-    looked up opportunistically; when absent we fall back to DOM + text
-    signals only.
+    interceptor captures — ``ad_placements``, ``is_ad_flag`` — are looked
+    up opportunistically; when absent we fall back to DOM + text signals
+    only.
+
+    ``max_short_duration`` defaults to 180s to match YouTube's current
+    Shorts length cap; set higher to disable the duration signal or
+    lower if you want to be stricter.
     """
     meta = meta or {}
     reasons: list[str] = []
@@ -113,12 +129,12 @@ def classify(page: Page, meta: dict[str, Any] | None) -> AdVerdict:
     if meta.get("is_ad_flag"):
         reasons.append("player:is_ad_flag")
 
-    # Duration anomaly. Shorts are <=60s; the feed sometimes serves promoted
-    # long-form in the reel slot.
+    # Duration anomaly. Legitimate Shorts can now run up to 180s; anything
+    # above that is almost certainly a promoted long-form in the reel slot.
     duration = meta.get("duration_seconds")
     try:
-        if duration is not None and float(duration) > 60.0:
-            reasons.append("duration:over_60s")
+        if duration is not None and float(duration) > max_short_duration:
+            reasons.append(f"duration:over_{int(max_short_duration)}s")
     except (TypeError, ValueError):
         pass
 

@@ -82,17 +82,29 @@ def test_player_is_ad_flag():
     assert "player:is_ad_flag" in v.reasons
 
 
-def test_duration_over_60s_flags_ad():
+def test_duration_over_max_flags_ad():
     page = FakePage()
-    v = classify(page, {"duration_seconds": 90.0})
+    # Default max_short_duration is 180s (matches YouTube's current Shorts cap).
+    v = classify(page, {"duration_seconds": 240.0})
     assert v.is_ad is True
-    assert "duration:over_60s" in v.reasons
+    assert any(r.startswith("duration:over_") for r in v.reasons)
 
 
-@pytest.mark.parametrize("duration", [None, 0, 15.0, 60.0])
+@pytest.mark.parametrize("duration", [None, 0, 15.0, 60.0, 90.0, 180.0])
 def test_short_durations_are_not_flagged(duration):
     page = FakePage(text="totally organic content")
     v = classify(page, {"duration_seconds": duration})
+    assert v.is_ad is False
+
+
+def test_duration_threshold_is_overridable():
+    page = FakePage()
+    # With strict 60s threshold, a 90s Short flags as ad.
+    v = classify(page, {"duration_seconds": 90.0}, max_short_duration=60.0)
+    assert v.is_ad is True
+    assert "duration:over_60s" in v.reasons
+    # With the stricter threshold raised, same Short is fine.
+    v = classify(page, {"duration_seconds": 90.0}, max_short_duration=200.0)
     assert v.is_ad is False
 
 
