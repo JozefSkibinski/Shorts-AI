@@ -3,6 +3,10 @@
 Opens YouTube Shorts in an incognito Playwright context so browsing does not
 influence the logged-in algorithm, auto-scrolls through videos, and records
 metadata for every Short with more than 1,000,000 views.
+
+View count, title, author, length and description come from the internal
+``/youtubei/v1/player`` responses that YouTube fires for each Short as it
+loads, which is far more reliable than scraping the rendered DOM.
 """
 
 from __future__ import annotations
@@ -14,15 +18,16 @@ import logging
 import random
 import re
 import sys
-import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Iterable
 
 from playwright.sync_api import (
     Browser,
     BrowserContext,
     Page,
+    Response,
     TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
 )
@@ -64,24 +69,6 @@ class ShortRecord:
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
-VIEW_SUFFIXES = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
-
-
-def parse_view_count(raw: str | None) -> int:
-    """Convert '1.2M views' / '523K' / '1,234,567 views' into an int."""
-    if not raw:
-        return 0
-    text = raw.strip().lower().replace("views", "").replace("view", "").strip()
-    text = text.replace(",", "")
-    if not text:
-        return 0
-    match = re.match(r"([\d.]+)\s*([kmb]?)", text)
-    if not match:
-        return 0
-    number = float(match.group(1))
-    suffix = match.group(2)
-    return int(number * VIEW_SUFFIXES.get(suffix, 1))
-
 
 def extract_hashtags(*texts: str | None) -> list[str]:
     tags: list[str] = []
@@ -115,7 +102,7 @@ def fetch_transcript(video_id: str) -> tuple[str | None, str | None]:
         )
     except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable):
         return None, None
-    except Exception as exc:  # network / parser errors
+    except Exception as exc:
         log.debug("Transcript failed for %s: %s", video_id, exc)
         return None, None
 
@@ -130,12 +117,79 @@ def fetch_transcript(video_id: str) -> tuple[str | None, str | None]:
 
 
 # ---------------------------------------------------------------------------
+# Network interception
+# ---------------------------------------------------------------------------
+
+
+class MetadataStore:
+    """Thread-safe map of video_id -> metadata dict captured from /player."""
+
+    def __init__(self) -> None:
+        self._data: dict[str, dict] = {}
+        self._lock = Lock()
+
+    def update(self, video_id: str, fields: dict) -> None:
+        with self._lock:
+            existing = self._data.setdefault(video_id, {})
+            for k, v in fields.items():
+                if v is not None and v != "":
+                    existing[k] = v
+
+    def get(self, video_id: str) -> dict | None:
+        with self._lock:
+            return dict(self._data.get(video_id) or {}) or None
+
+
+def _parse_player_payload(payload: dict) -> tuple[str | None, dict]:
+    details = payload.get("videoDetails") or {}
+    vid = details.get("videoId")
+    if not vid:
+        return None, {}
+
+    try:
+        views = int(details.get("viewCount") or 0)
+    except (TypeError, ValueError):
+        views = 0
+    try:
+        duration = float(details.get("lengthSeconds") or 0) or None
+    except (TypeError, ValueError):
+        duration = None
+
+    keywords = details.get("keywords") or []
+    fields = {
+        "title": (details.get("title") or "").strip(),
+        "channel": (details.get("author") or "").strip(),
+        "description": (details.get("shortDescription") or "").strip(),
+        "view_count": views,
+        "duration_seconds": duration,
+        "keywords": list(keywords),
+    }
+    return vid, fields
+
+
+def install_player_interceptor(context: BrowserContext, store: MetadataStore) -> None:
+    def handle(response: Response) -> None:
+        url = response.url
+        if "/youtubei/v1/player" not in url:
+            return
+        try:
+            data = response.json()
+        except Exception:
+            return
+        vid, fields = _parse_player_payload(data)
+        if vid and fields:
+            store.update(vid, fields)
+            log.debug("captured %s: %s views", vid, fields.get("view_count"))
+
+    context.on("response", handle)
+
+
+# ---------------------------------------------------------------------------
 # Page interaction
 # ---------------------------------------------------------------------------
 
 
 def dismiss_consent(page: Page) -> None:
-    """Best-effort dismissal of the EU / cookie consent wall."""
     selectors = [
         'button[aria-label*="Accept all"]',
         'button[aria-label*="Reject all"]',
@@ -156,64 +210,47 @@ def dismiss_consent(page: Page) -> None:
             continue
 
 
-def current_short_data(page: Page) -> dict | None:
-    """Read DOM fields for the currently visible Short."""
-    js = """
-    () => {
-        const active = document.querySelector('ytd-reel-video-renderer[is-active]')
-            || document.querySelector('ytd-shorts ytd-reel-video-renderer');
-        if (!active) return null;
-
-        const text = (sel) => {
-            const el = active.querySelector(sel);
-            return el ? (el.innerText || el.textContent || '').trim() : '';
-        };
-
-        const title = text('yt-shorts-video-title-view-model')
-            || text('h2.title')
-            || text('#title');
-
-        const channel = text('ytd-channel-name a')
-            || text('#channel-name a')
-            || text('a.yt-simple-endpoint[href*="/@"]');
-
-        // Description / caption
-        let description = text('#description')
-            || text('#caption')
-            || text('yt-shorts-video-description-view-model');
-
-        // View count appears in several layouts
-        let views = '';
-        const viewEl = active.querySelector(
-            '[aria-label*="views" i], [aria-label*="View count"], #view-count, .view-count'
-        );
-        if (viewEl) {
-            views = viewEl.getAttribute('aria-label') || viewEl.innerText || '';
-        }
-
-        // Video element for duration
-        const videoEl = active.querySelector('video');
-        const duration = videoEl && !isNaN(videoEl.duration) ? videoEl.duration : null;
-
-        return {
-            title,
-            channel,
-            description,
-            views_text: views,
-            duration,
-            href: location.href,
-        };
-    }
-    """
+def current_video_id(page: Page) -> str | None:
+    """Read the currently visible Short's video id from the URL or DOM."""
     try:
-        return page.evaluate(js)
-    except Exception as exc:
-        log.debug("DOM read failed: %s", exc)
-        return None
+        href = page.evaluate("() => location.href")
+    except Exception:
+        href = ""
+    vid = extract_video_id(href or "")
+    if vid:
+        return vid
+    try:
+        vid = page.evaluate(
+            """() => {
+                const a = document.querySelector('ytd-reel-video-renderer[is-active]');
+                if (!a) return null;
+                const id = a.getAttribute('video-id') || a.id;
+                return id || null;
+            }"""
+        )
+    except Exception:
+        vid = None
+    return vid
+
+
+def wait_for_metadata(
+    store: MetadataStore, video_id: str, timeout_ms: int = 6000
+) -> dict | None:
+    """Poll the store until the /player response for this id arrives."""
+    waited = 0
+    step = 250
+    while waited < timeout_ms:
+        meta = store.get(video_id)
+        if meta and meta.get("view_count") is not None:
+            return meta
+        import time as _t
+
+        _t.sleep(step / 1000.0)
+        waited += step
+    return store.get(video_id)
 
 
 def advance(page: Page) -> None:
-    """Move to the next Short. 'j' works when no input is focused."""
     page.keyboard.press("ArrowDown")
     page.wait_for_timeout(random.randint(1500, 2800))
 
@@ -265,6 +302,7 @@ def scrape(
     csv_path = output_dir / "shorts.csv"
     jsonl_path = output_dir / "shorts.jsonl"
 
+    store = MetadataStore()
     seen_ids: set[str] = set()
     kept = 0
     scanned = 0
@@ -275,8 +313,6 @@ def scrape(
             headless=headless,
             args=["--disable-blink-features=AutomationControlled", "--incognito"],
         )
-        # A fresh context with no storage_state is effectively incognito; combined
-        # with the --incognito flag above it guarantees no profile data is reused.
         context: BrowserContext = browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 430, "height": 900},
@@ -284,6 +320,7 @@ def scrape(
             java_script_enabled=True,
         )
         context.clear_cookies()
+        install_player_interceptor(context, store)
 
         page = context.new_page()
         log.info("Opening %s", SHORTS_URL)
@@ -300,9 +337,9 @@ def scrape(
         page.wait_for_timeout(2500)
 
         while scanned < max_videos:
-            page.wait_for_timeout(1200)
-            data = current_short_data(page)
-            if not data or not data.get("href"):
+            page.wait_for_timeout(800)
+            video_id = current_video_id(page)
+            if not video_id:
                 empty_streak += 1
                 if empty_streak > 5:
                     log.warning("Too many empty reads, stopping")
@@ -311,20 +348,26 @@ def scrape(
                 continue
             empty_streak = 0
 
-            video_id = extract_video_id(data["href"])
-            if not video_id or video_id in seen_ids:
+            if video_id in seen_ids:
                 advance(page)
                 continue
             seen_ids.add(video_id)
             scanned += 1
 
-            views = parse_view_count(data.get("views_text"))
-            title = (data.get("title") or "").strip()
-            channel = (data.get("channel") or "").strip()
-            description = (data.get("description") or "").strip()
+            meta = wait_for_metadata(store, video_id, timeout_ms=7000) or {}
+            views = int(meta.get("view_count") or 0)
+            title = meta.get("title") or ""
+            channel = meta.get("channel") or ""
+            description = meta.get("description") or ""
+            keywords = meta.get("keywords") or []
+            duration = meta.get("duration_seconds")
 
             log.info(
-                "[%d] %s | %s | %s views", scanned, channel or "?", title[:60], f"{views:,}"
+                "[%d] %s | %s | %s views",
+                scanned,
+                channel or "?",
+                title[:60] or "?",
+                f"{views:,}",
             )
 
             if views < min_views:
@@ -332,15 +375,20 @@ def scrape(
                 continue
 
             transcript, hook = fetch_transcript(video_id)
+            hashtags = extract_hashtags(title, description)
+            for kw in keywords:
+                if kw.startswith("#") and kw not in hashtags:
+                    hashtags.append(kw)
+
             record = ShortRecord(
                 video_id=video_id,
                 url=f"https://www.youtube.com/shorts/{video_id}",
                 channel=channel,
                 title=title,
                 description=description,
-                hashtags=extract_hashtags(title, description),
+                hashtags=hashtags,
                 view_count=views,
-                duration_seconds=data.get("duration"),
+                duration_seconds=duration,
                 transcript=transcript,
                 hook=hook,
             )
