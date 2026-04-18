@@ -185,6 +185,84 @@ def install_player_interceptor(context: BrowserContext, store: MetadataStore) ->
 
 
 # ---------------------------------------------------------------------------
+# HTTP fallback: fetch the Short's page and parse ytInitialPlayerResponse
+# ---------------------------------------------------------------------------
+
+
+def _balanced_json(text: str, start: int) -> str | None:
+    """Return the JSON object starting at index `start` (must be a '{')."""
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def parse_initial_player_response(html: str) -> dict | None:
+    marker = "ytInitialPlayerResponse"
+    idx = html.find(marker)
+    if idx == -1:
+        return None
+    brace = html.find("{", idx)
+    if brace == -1:
+        return None
+    blob = _balanced_json(html, brace)
+    if not blob:
+        return None
+    try:
+        return json.loads(blob)
+    except json.JSONDecodeError:
+        return None
+
+
+def fetch_metadata_http(context: BrowserContext, video_id: str) -> dict | None:
+    """Fetch the Short's HTML page via the incognito context and parse metadata."""
+    url = f"https://www.youtube.com/shorts/{video_id}"
+    try:
+        resp = context.request.get(
+            url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml",
+            },
+            timeout=15_000,
+        )
+        if not resp.ok:
+            log.debug("HTTP %s for %s", resp.status, video_id)
+            return None
+        html = resp.text()
+    except Exception as exc:
+        log.debug("HTTP fetch failed for %s: %s", video_id, exc)
+        return None
+
+    payload = parse_initial_player_response(html)
+    if not payload:
+        log.debug("no ytInitialPlayerResponse for %s", video_id)
+        return None
+    _, fields = _parse_player_payload(payload)
+    return fields or None
+
+
+# ---------------------------------------------------------------------------
 # Page interaction
 # ---------------------------------------------------------------------------
 
@@ -234,19 +312,33 @@ def current_video_id(page: Page) -> str | None:
 
 
 def wait_for_metadata(
-    store: MetadataStore, video_id: str, timeout_ms: int = 6000
+    context: BrowserContext,
+    store: MetadataStore,
+    video_id: str,
+    timeout_ms: int = 4000,
 ) -> dict | None:
-    """Poll the store until the /player response for this id arrives."""
+    """Return metadata for video_id.
+
+    Waits briefly for the /player response interceptor to populate the store,
+    then falls back to fetching the Short's HTML page over HTTP and parsing
+    ``ytInitialPlayerResponse``. The HTTP path is the reliable one — the
+    interceptor is just an optimisation when it happens to fire.
+    """
+    import time as _t
+
     waited = 0
     step = 250
     while waited < timeout_ms:
         meta = store.get(video_id)
-        if meta and meta.get("view_count") is not None:
+        if meta and meta.get("view_count"):
             return meta
-        import time as _t
-
         _t.sleep(step / 1000.0)
         waited += step
+
+    fields = fetch_metadata_http(context, video_id)
+    if fields:
+        store.update(video_id, fields)
+        return store.get(video_id)
     return store.get(video_id)
 
 
@@ -354,7 +446,7 @@ def scrape(
             seen_ids.add(video_id)
             scanned += 1
 
-            meta = wait_for_metadata(store, video_id, timeout_ms=7000) or {}
+            meta = wait_for_metadata(context, store, video_id, timeout_ms=4000) or {}
             views = int(meta.get("view_count") or 0)
             title = meta.get("title") or ""
             channel = meta.get("channel") or ""
