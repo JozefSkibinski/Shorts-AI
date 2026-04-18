@@ -91,6 +91,103 @@ For Phase 1:
 
 ---
 
+## Distributed scraping
+
+When run on N machines simultaneously, each scraper writes **batch files**
+(gzipped JSONL) under `output/batches/<YYYY>/<MM>/<DD>/<machine_id>/<session>-<hour>.jsonl.gz`
+in addition to the legacy `shorts.jsonl`. Each batch is bracketed by a
+`batch_header` (machine identity, session envelope) and a `batch_footer`
+(record count, ads filtered).
+
+The persistent machine UUID lives in `$XDG_STATE_HOME/shorts-scraper/machine_id`
+and survives restarts — re-running the scraper on the same box keeps the
+same identity, so the ingestor can attribute snapshots correctly.
+
+Upload strategy is left to the deploy: sync the `batches/` tree to S3/R2
+with any tool you prefer (`aws s3 sync`, `rclone`, `rsync` to a shared
+volume). The ingestor reads the same layout from either a local
+directory or an S3 bucket — no code changes.
+
+## Ingestion (one-per-fleet central process)
+
+```bash
+cd shorts_ai
+# local staging (dev, or single-machine deploys):
+python -m app.ingestor.main --root ../output/batches --watch
+
+# S3-backed staging:
+python -m app.ingestor.main --s3-bucket shorts-raw --s3-prefix batches/ --watch
+```
+
+What it does:
+
+1. Parses each batch (gzip + JSONL; missing footer is tolerated, missing
+   or garbage header is quarantined).
+2. Upserts `scraper_machines` / `scraper_sessions` from the header.
+3. For every observation:
+   - exact-dedup upsert into `videos` (keyed by `source_video_id`);
+     `first_seen_at` is set on insert and never overwritten, `last_seen_at`
+     is refreshed on every observation.
+   - appends a `video_metrics_snapshots` row tagged with
+     `source_machine_id` + `source_session_id`. Observations from the
+     same machine within 5 minutes with view-count delta < 100 are
+     collapsed to prevent per-loop bloat.
+4. Enqueues enrichment via Celery exactly once per new video.
+5. Records the batch in `raw_batches` (`pending`/`ingested`/`failed`/`quarantined`)
+   and moves successfully-ingested keys to the `archived/` prefix.
+
+**Do not delete raw batches after ingest** — keep them so you can replay
+with improved dedup logic later.
+
+## Near-duplicate clustering
+
+Enrichment computes `phash_first`, `phash_mid`, and `audio_chromaprint`
+alongside the existing CLIP / text embeddings. A nightly Celery beat
+task (`cluster_unassigned`, scheduled 03:10 UTC) groups videos with ≥2
+confirming signals (pHash Hamming < 5, same chromaprint, CLIP cosine
+< 0.08, text cosine < 0.10) into `content_clusters`. The representative
+for each cluster is the member with the highest `peak_velocity`.
+
+Run manually:
+
+```bash
+cd shorts_ai
+python -c "from workers.celery_app import cluster_unassigned; print(cluster_unassigned())"
+```
+
+Collapse top-performers by cluster (the query the agent uses):
+
+```sql
+SELECT DISTINCT ON (v.content_cluster_id) v.id, v.url, va.peak_velocity
+FROM videos v
+JOIN video_analyses va ON va.video_id = v.id
+WHERE v.niche_id = $1 AND v.is_ad = false
+ORDER BY v.content_cluster_id, va.peak_velocity DESC
+LIMIT 20;
+```
+
+## Fleet health dashboard
+
+```sql
+SELECT
+  date_trunc('hour', captured_at)   AS hour,
+  COUNT(DISTINCT source_machine_id) AS active_machines,
+  COUNT(DISTINCT video_id)          AS unique_videos,
+  COUNT(*)                          AS total_snapshots,
+  ROUND(COUNT(*)::numeric
+        / NULLIF(COUNT(DISTINCT video_id), 0), 2) AS snapshots_per_video
+FROM video_metrics_snapshots
+WHERE captured_at > NOW() - INTERVAL '24 hours'
+GROUP BY 1 ORDER BY 1 DESC;
+```
+
+`snapshots_per_video` > 1.5 means machines are seeing overlap (good —
+velocity data). Close to 1.0 means the feeds are suspiciously disjoint —
+either niche specialization is too aggressive or session rotation
+isn't clearing state fast enough.
+
+---
+
 ## Phase 1 — running the data foundation
 
 ```bash

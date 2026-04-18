@@ -67,6 +67,15 @@ class Video(Base):
         PG_UUID(as_uuid=True),
         ForeignKey("scraper_sessions.id", ondelete="SET NULL"),
     )
+    first_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    first_seen_by_session: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("scraper_sessions.id", ondelete="SET NULL"),
+    )
+    content_cluster_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("content_clusters.id", ondelete="SET NULL")
+    )
 
     snapshots: Mapped[list["VideoMetricsSnapshot"]] = relationship(
         back_populates="video",
@@ -98,6 +107,8 @@ class VideoMetricsSnapshot(Base):
     like_count: Mapped[int | None] = mapped_column(BigInteger)
     comment_count: Mapped[int | None] = mapped_column(BigInteger)
     hours_since_publish: Mapped[float | None] = mapped_column(Float)
+    source_machine_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    source_session_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True))
 
     video: Mapped[Video] = relationship(back_populates="snapshots")
 
@@ -126,6 +137,9 @@ class VideoAnalysis(Base):
     velocity_72h: Mapped[float | None] = mapped_column(Float)
     peak_velocity: Mapped[float | None] = mapped_column(Float)
     niche_percentile: Mapped[float | None] = mapped_column(Float)
+    phash_first: Mapped[int | None] = mapped_column(BigInteger)
+    phash_mid: Mapped[int | None] = mapped_column(BigInteger)
+    audio_chromaprint: Mapped[str | None] = mapped_column(Text)
     analyzed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -159,10 +173,55 @@ class ScraperSession(Base):
     unique_channels_seen: Mapped[int] = mapped_column(Integer, default=0)
     channels_distribution: Mapped[dict | None] = mapped_column(JSONB)
     niche_distribution: Mapped[dict | None] = mapped_column(JSONB)
+    machine_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("scraper_machines.id", ondelete="SET NULL"),
+    )
 
     videos: Mapped[list[Video]] = relationship(
         back_populates="session", foreign_keys="Video.session_id"
     )
+    machine: Mapped["ScraperMachine | None"] = relationship(back_populates="sessions")
+
+
+class ScraperMachine(Base):
+    __tablename__ = "scraper_machines"
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    hostname: Mapped[str | None] = mapped_column(Text)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    total_batches: Mapped[int] = mapped_column(Integer, default=0)
+    scraper_version: Mapped[str | None] = mapped_column(Text)
+
+    sessions: Mapped[list[ScraperSession]] = relationship(back_populates="machine")
+
+
+class ContentCluster(Base):
+    __tablename__ = "content_clusters"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    representative_video_id: Mapped[int | None] = mapped_column(BigInteger)
+    size: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class RawBatch(Base):
+    __tablename__ = "raw_batches"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    s3_key: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    machine_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    session_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ingested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    records: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
 
 
 class VideoAdVerdict(Base):

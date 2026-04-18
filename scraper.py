@@ -54,7 +54,9 @@ except ImportError:  # runtime check with a clear message
     yt_dlp = None  # type: ignore[assignment]
 
 import ad_filter
+import machine_identity
 import stats as stats_module
+from batch_writer import BatchEnvelope, BatchWriter
 from session_manager import SessionManager
 
 
@@ -726,6 +728,22 @@ def scrape(
     jsonl_path = output_dir / "shorts.jsonl"
     ads_path = output_dir / "ads_filtered.jsonl"
 
+    machine_meta = machine_identity.current(
+        config={
+            "max_videos": max_videos,
+            "min_views": min_views,
+            "whisper_model": whisper_model,
+            "output_dir": str(output_dir),
+        }
+    )
+    log.info(
+        "machine_id=%s host=%s scraper=%s config=%s",
+        machine_meta.machine_id,
+        machine_meta.hostname,
+        machine_meta.scraper_version,
+        machine_meta.scraper_config_hash,
+    )
+
     store = MetadataStore()
     resumed_ids = load_previous_ids(jsonl_path)
     if resumed_ids:
@@ -752,6 +770,35 @@ def scrape(
             output_dir=output_dir,
             context_setup=_setup_context,
         )
+
+        batch_writer: BatchWriter | None = None
+        current_batch_session: str | None = None
+
+        def _swap_batch_writer(session_obj) -> BatchWriter:
+            """Close the previous batch file (if any) and open one for the current session."""
+            nonlocal batch_writer, current_batch_session
+            if batch_writer is not None:
+                try:
+                    batch_writer.close(
+                        footer_extras={
+                            "ads_filtered": session_obj.ads_filtered,
+                        }
+                    )
+                except Exception as exc:
+                    log.warning("batch_writer.close failed: %s", exc)
+            envelope = BatchEnvelope(
+                machine_id=machine_meta.machine_id,
+                hostname=machine_meta.hostname,
+                scraper_version=machine_meta.scraper_version,
+                scraper_config_hash=machine_meta.scraper_config_hash,
+                session_id=session_obj.id,
+                session_started_at=session_obj.created_at.isoformat(),
+                user_agent=session_obj.user_agent,
+                viewport=f"{session_obj.viewport['width']}x{session_obj.viewport['height']}",
+            )
+            batch_writer = BatchWriter(output_dir, envelope)
+            current_batch_session = session_obj.id
+            return batch_writer
 
         last_id: str | None = None
         try:
@@ -840,6 +887,32 @@ def scrape(
                     ),
                 )
                 append_record(data_path, jsonl_path, record)
+                # Distributed batch emission: swap writers on session rotation,
+                # write one observation per kept record. Transcript + hook ride
+                # along so the ingestor can populate video_analyses on first
+                # sight, even though enrichment will still fill in embeddings.
+                if session is not None and session.id != current_batch_session:
+                    _swap_batch_writer(session)
+                if batch_writer is not None:
+                    batch_writer.write_observation(
+                        {
+                            "source_video_id": record.video_id,
+                            "url": record.url,
+                            "author_handle": record.channel or None,
+                            "title": record.title or None,
+                            "description": record.description or None,
+                            "hashtags": record.hashtags or [],
+                            "keywords": record.keywords or [],
+                            "duration_seconds": record.duration_seconds,
+                            "view_count": record.view_count,
+                            "is_ad": False,
+                            "has_paid_promotion_disclosure": record.has_paid_promotion_disclosure,
+                            "transcript": record.transcript,
+                            "hook": record.hook,
+                            "metadata_source": record.metadata_source,
+                            "transcript_source": record.transcript_source,
+                        }
+                    )
                 kept += 1
                 sessions.record_kept(channel)
                 if channel:
@@ -854,6 +927,14 @@ def scrape(
 
                 last_id = advance(page, video_id)
         finally:
+            if batch_writer is not None:
+                try:
+                    footer_extras = {}
+                    if sessions.current is not None:
+                        footer_extras["ads_filtered"] = sessions.current.ads_filtered
+                    batch_writer.close(footer_extras=footer_extras)
+                except Exception as exc:
+                    log.warning("batch_writer.close failed on shutdown: %s", exc)
             sessions.close()
             browser.close()
 
