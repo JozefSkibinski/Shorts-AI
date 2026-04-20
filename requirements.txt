@@ -1,0 +1,14 @@
+# Discord bot framework (slash commands via app_commands)
+discord.py>=2.3.2,<3.0.0
+
+# Google Trends client
+pytrends>=4.9.2
+
+# Environment variable loading
+python-dotenv>=1.0.1
+
+# Chart rendering for /compare_trends
+matplotlib>=3.8.0
+
+# pytrends transitive dependency pin for stability
+pandas>=2.0.0
