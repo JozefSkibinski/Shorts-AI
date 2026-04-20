@@ -4,6 +4,10 @@ discord.py>=2.3.2,<3.0.0
 # Google Trends client
 pytrends>=4.9.2
 
+# pytrends 4.9.x calls urllib3.Retry(method_whitelist=...), which was removed
+# in urllib3 2.x. Pin to the 1.x line until pytrends ships a fix.
+urllib3<2
+
 # Environment variable loading
 python-dotenv>=1.0.1
 
