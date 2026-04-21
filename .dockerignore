@@ -1,0 +1,40 @@
+# Git & VCS
+.git
+.gitignore
+.github
+
+# Python build/runtime artefacts
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Virtualenvs
+.venv
+venv
+env
+
+# Secrets & local config
+.env
+.env.local
+
+# Tests, CI and docs (not needed at runtime)
+tests
+pytest.ini
+README.md
+.dockerignore
+Dockerfile
+
+# Local SQLite data & logs
+data
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Editors / OS
+.idea
+.vscode
+.DS_Store

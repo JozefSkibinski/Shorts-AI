@@ -132,6 +132,111 @@ def compare_trends_embed(
     return embed
 
 
+def paged_related_trends_embeds(
+    keyword: str,
+    geo: str,
+    timeframe: str,
+    top: Sequence[Mapping[str, object]],
+    rising: Sequence[Mapping[str, object]],
+    *,
+    per_page: int = 10,
+) -> list[discord.Embed]:
+    """Split a related-trends result into multiple embeds for pagination."""
+    def _chunk(rows: Sequence[Mapping[str, object]]) -> list[list[Mapping[str, object]]]:
+        if not rows:
+            return [[]]
+        return [list(rows[i : i + per_page]) for i in range(0, len(rows), per_page)]
+
+    top_chunks = _chunk(top)
+    rising_chunks = _chunk(rising)
+    pages_count = max(len(top_chunks), len(rising_chunks))
+    embeds: list[discord.Embed] = []
+    for i in range(pages_count):
+        top_slice = top_chunks[i] if i < len(top_chunks) else []
+        rising_slice = rising_chunks[i] if i < len(rising_chunks) else []
+        embed = related_trends_embed(
+            keyword=keyword,
+            geo=geo,
+            timeframe=timeframe,
+            top=top_slice,
+            rising=rising_slice,
+            limit=per_page,
+        )
+        embed.title = f"{embed.title} — page {i + 1}/{pages_count}"
+        embeds.append(embed)
+    return embeds
+
+
+def youtube_videos_embed(
+    query: str,
+    region: str,
+    videos: Sequence[Mapping[str, object]],
+) -> discord.Embed:
+    """Build the embed returned by ``/youtube_videos`` (YouTube Data API)."""
+    embed = discord.Embed(
+        title=f"Top YouTube videos — {query}",
+        description=(
+            "Real YouTube videos ordered by view count. "
+            "This uses the YouTube Data API, not Google Trends."
+        ),
+        color=COLOR_PRIMARY,
+        timestamp=datetime.now(timezone.utc),
+    )
+    if not videos:
+        embed.add_field(name="No data", value="No videos matched.", inline=False)
+    else:
+        for i, v in enumerate(videos, start=1):
+            title = str(v.get("title", "?"))
+            channel = str(v.get("channel", "?"))
+            views = v.get("view_count")
+            likes = v.get("like_count")
+            url = v.get("url") or ""
+            bits = [f"👤 {channel}"]
+            if views is not None:
+                bits.append(f"👁 {int(views):,}")
+            if likes is not None:
+                bits.append(f"👍 {int(likes):,}")
+            embed.add_field(
+                name=f"{i}. {title[:240]}",
+                value=f"{' • '.join(bits)}\n{url}",
+                inline=False,
+            )
+    footer_region = region or "Worldwide"
+    embed.set_footer(
+        text=f"Source: YouTube Data API v3 • Region: {footer_region}"
+    )
+    return embed
+
+
+def diff_embed(
+    keyword: str,
+    geo: str,
+    timeframe: str,
+    diff: Mapping[str, Sequence[str]],
+    *,
+    previous_timestamp: str,
+) -> discord.Embed:
+    """Embed comparing current vs. previous snapshot of a related-queries result."""
+    embed = discord.Embed(
+        title=f"Week-over-week change for: {keyword}",
+        description=f"Compared against snapshot taken at `{previous_timestamp}`.",
+        color=COLOR_SUCCESS,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    def _fmt(items: Sequence[str], empty: str) -> str:
+        if not items:
+            return f"_{empty}_"
+        return "\n".join(f"• {q}" for q in items[:15])
+
+    embed.add_field(name="🆕 New queries", value=_fmt(diff.get("new", []), "none"),
+                    inline=False)
+    embed.add_field(name="📉 Dropped off", value=_fmt(diff.get("dropped", []), "none"),
+                    inline=False)
+    embed.set_footer(text=_footer_text(geo, timeframe))
+    return embed
+
+
 def error_embed(message: str, *, title: str = "Something went wrong") -> discord.Embed:
     """A consistent red embed for surface-level errors."""
     return discord.Embed(title=title, description=message, color=COLOR_ERROR)

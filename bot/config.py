@@ -28,16 +28,47 @@ def _get_int(name: str, default: int) -> int:
         return default
 
 
+def _get_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     """Immutable runtime settings."""
 
+    # Discord
     discord_token: str
     guild_id: Optional[int]
     log_level: str
+
+    # pytrends HTTP tuning
     pytrends_timeout_connect: int
     pytrends_timeout_read: int
     pytrends_proxy: Optional[str]
+
+    # Cache
+    cache_ttl_seconds: int
+    cache_max_size: int
+    suggestion_cache_ttl_seconds: int
+
+    # Storage
+    database_url: str                       # e.g. sqlite:///data/shorts_ai.db
+
+    # Scheduler
+    daily_digest_enabled: bool
+    daily_digest_hour_utc: int              # 0-23
+    daily_digest_minute_utc: int            # 0-59
+
+    # Healthcheck
+    healthcheck_enabled: bool
+    healthcheck_host: str
+    healthcheck_port: int
+
+    # YouTube Data API (optional)
+    youtube_api_key: Optional[str]
 
 
 def load_settings() -> Settings:
@@ -60,4 +91,17 @@ def load_settings() -> Settings:
         pytrends_timeout_connect=_get_int("PYTRENDS_TIMEOUT_CONNECT", 10),
         pytrends_timeout_read=_get_int("PYTRENDS_TIMEOUT_READ", 25),
         pytrends_proxy=proxy,
+        cache_ttl_seconds=_get_int("CACHE_TTL_SECONDS", 600),
+        cache_max_size=_get_int("CACHE_MAX_SIZE", 512),
+        suggestion_cache_ttl_seconds=_get_int("SUGGESTION_CACHE_TTL_SECONDS", 3600),
+        database_url=os.getenv(
+            "DATABASE_URL", "sqlite:///data/shorts_ai.db"
+        ).strip(),
+        daily_digest_enabled=_get_bool("DAILY_DIGEST_ENABLED", False),
+        daily_digest_hour_utc=max(0, min(23, _get_int("DAILY_DIGEST_HOUR_UTC", 13))),
+        daily_digest_minute_utc=max(0, min(59, _get_int("DAILY_DIGEST_MINUTE_UTC", 0))),
+        healthcheck_enabled=_get_bool("HEALTHCHECK_ENABLED", True),
+        healthcheck_host=os.getenv("HEALTHCHECK_HOST", "0.0.0.0").strip(),
+        healthcheck_port=_get_int("HEALTHCHECK_PORT", 8080),
+        youtube_api_key=os.getenv("YOUTUBE_API_KEY", "").strip() or None,
     )

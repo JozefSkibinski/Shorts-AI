@@ -1,4 +1,4 @@
-"""Thin async-friendly wrapper around ``pytrends``.
+"""Thin async-friendly wrapper around ``pytrends`` + an in-memory TTL cache.
 
 ``pytrends`` is a synchronous library that internally uses ``requests``. We
 wrap every blocking call in :func:`asyncio.to_thread` so the Discord bot's
@@ -8,6 +8,9 @@ The wrapper also centralises error translation: pytrends raises bare
 ``requests`` exceptions and ``TooManyRequestsError`` which we convert into
 the custom exceptions below so the command layer can render friendly
 embeds without knowing any implementation details.
+
+Results are cached in :class:`TTLKeyCache` instances so repeated queries
+within the TTL window don't hit Google Trends at all.
 """
 
 from __future__ import annotations
@@ -22,6 +25,8 @@ from pytrends.exceptions import ResponseError, TooManyRequestsError
 from pytrends.request import TrendReq
 from requests.exceptions import ConnectionError as ReqConnectionError
 from requests.exceptions import ReadTimeout, RequestException
+
+from bot.services.cache import TTLKeyCache, make_key
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +53,7 @@ class TrendsNoData(TrendsServiceError):
 
 
 # ---------------------------------------------------------------------------
-# Data container
+# Data containers
 # ---------------------------------------------------------------------------
 
 
@@ -60,18 +65,22 @@ class RelatedQueries:
     rising: List[Dict[str, Any]]
 
 
+@dataclass(frozen=True)
+class Suggestion:
+    """A keyword suggestion as returned by Google Trends' suggestions API."""
+
+    mid: str    # canonical topic id, e.g. "/m/0bs5k8r"
+    title: str
+    type: str   # "Topic", "Musician", etc.
+
+
 # ---------------------------------------------------------------------------
 # Service
 # ---------------------------------------------------------------------------
 
 
 class TrendsService:
-    """Async wrapper around a single ``TrendReq`` instance.
-
-    A small pool of :class:`TrendReq` objects isn't really necessary because
-    Google Trends rate-limits aggressively per-IP; instead we rely on a
-    single client and a semaphore to serialise concurrent requests.
-    """
+    """Async wrapper around a single ``TrendReq`` instance + TTL cache."""
 
     YOUTUBE_GPROP = "youtube"
 
@@ -82,6 +91,8 @@ class TrendsService:
         timeout_read: int = 25,
         proxy: Optional[str] = None,
         max_concurrency: int = 2,
+        result_cache: Optional[TTLKeyCache] = None,
+        suggestion_cache: Optional[TTLKeyCache] = None,
     ) -> None:
         proxies = [proxy] if proxy else []
         # ``hl`` is the UI language; ``tz`` is the timezone offset in minutes
@@ -95,6 +106,8 @@ class TrendsService:
             backoff_factor=0.5,
         )
         self._sem = asyncio.Semaphore(max_concurrency)
+        self._result_cache = result_cache
+        self._suggestion_cache = suggestion_cache
 
     # --- public API --------------------------------------------------------
 
@@ -105,18 +118,23 @@ class TrendsService:
         geo: str = "",
         timeframe: str = "today 3-m",
     ) -> RelatedQueries:
-        """Return top + rising related YouTube search queries for ``keyword``."""
-        raw = await self._run(
-            self._related_queries_sync, keyword, geo, timeframe
-        )
-        top = _safe_records(raw.get(keyword, {}).get("top"))
-        rising = _safe_records(raw.get(keyword, {}).get("rising"))
-        if not top and not rising:
-            raise TrendsNoData(
-                f"No related queries for `{keyword}` in region "
-                f"`{geo or 'WW'}` / `{timeframe}`."
+        """Top + rising related YouTube searches for ``keyword``."""
+        key = make_key("related", keyword, geo, timeframe)
+
+        async def fetch() -> RelatedQueries:
+            raw = await self._run(
+                self._related_queries_sync, keyword, geo, timeframe
             )
-        return RelatedQueries(top=top, rising=rising)
+            top = _safe_records(raw.get(keyword, {}).get("top"))
+            rising = _safe_records(raw.get(keyword, {}).get("rising"))
+            if not top and not rising:
+                raise TrendsNoData(
+                    f"No related queries for `{keyword}` in region "
+                    f"`{geo or 'WW'}` / `{timeframe}`."
+                )
+            return RelatedQueries(top=top, rising=rising)
+
+        return await self._cached(self._result_cache, key, fetch)
 
     async def top_trends(
         self,
@@ -126,18 +144,8 @@ class TrendsService:
         timeframe: str = "now 7-d",
         limit: int = 10,
     ) -> List[Dict[str, Any]]:
-        """Return the top trending YouTube search queries for a region.
-
-        Google Trends does not expose a standalone "top YouTube trends today"
-        endpoint. The closest practical approximation is to query related
-        queries for a very broad seed term (``"youtube"`` by default) with
-        the YouTube property filter applied. This surfaces the queries that
-        are most strongly associated with broad YouTube activity in that
-        region over the requested timeframe.
-        """
+        """Top trending YouTube queries for a region (see docs for caveats)."""
         related = await self.related_queries(seed, geo=geo, timeframe=timeframe)
-        # "Rising" tends to reflect what's actually trending *right now*;
-        # fall back to "top" if rising is empty.
         rows = related.rising or related.top
         return rows[:limit]
 
@@ -152,25 +160,75 @@ class TrendsService:
         if not 2 <= len(keywords) <= 5:
             raise TrendsServiceError("compare_keywords requires 2-5 keywords.")
 
-        frame = await self._run(
-            self._interest_over_time_sync, list(keywords), geo, timeframe
-        )
+        key = make_key("compare", list(keywords), geo, timeframe)
 
-        if frame is None or frame.empty:
-            raise TrendsNoData(
-                "Google Trends returned no interest-over-time data for those keywords."
+        async def fetch():
+            frame = await self._run(
+                self._interest_over_time_sync, list(keywords), geo, timeframe
             )
+            if frame is None or frame.empty:
+                raise TrendsNoData(
+                    "Google Trends returned no interest-over-time data for those keywords."
+                )
+            data = frame.drop(
+                columns=[c for c in ("isPartial",) if c in frame.columns]
+            )
+            averages = {
+                kw: float(data[kw].mean()) for kw in keywords if kw in data.columns
+            }
+            if not averages:
+                raise TrendsNoData("No comparable data was returned for any keyword.")
+            winner = max(averages, key=averages.get)
+            return data, averages, winner
 
-        # Drop the ``isPartial`` bookkeeping column before computing averages.
-        data = frame.drop(columns=[c for c in ("isPartial",) if c in frame.columns])
-        averages: Dict[str, float] = {
-            kw: float(data[kw].mean()) for kw in keywords if kw in data.columns
-        }
-        if not averages:
-            raise TrendsNoData("No comparable data was returned for any keyword.")
+        return await self._cached(self._result_cache, key, fetch)
 
-        winner = max(averages, key=averages.get)
-        return data, averages, winner
+    async def suggestions(self, keyword: str) -> List[Suggestion]:
+        """Return keyword suggestions from Google Trends.
+
+        This is a best-effort endpoint; if it fails we return an empty list
+        rather than an exception — suggestions are a nicety, not critical.
+        """
+        cleaned = keyword.strip()
+        if not cleaned:
+            return []
+
+        key = make_key("suggest", cleaned)
+
+        async def fetch() -> List[Suggestion]:
+            try:
+                raw = await self._run(self._suggestions_sync, cleaned)
+            except TrendsServiceError:
+                return []
+            return [
+                Suggestion(
+                    mid=str(s.get("mid", "")),
+                    title=str(s.get("title", "")).strip(),
+                    type=str(s.get("type", "")).strip(),
+                )
+                for s in (raw or [])
+                if s.get("title")
+            ]
+
+        return await self._cached(self._suggestion_cache, key, fetch, default=[])
+
+    # --- cache helpers -----------------------------------------------------
+
+    async def _cached(self, cache: Optional[TTLKeyCache], key, factory, *, default=None):
+        if cache is None:
+            return await factory()
+        cached = await cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            value = await factory()
+        except TrendsNoData:
+            # Don't cache empty results — give Google a chance next time.
+            raise
+        if value is None:
+            return default
+        await cache.set(key, value)
+        return value
 
     # --- private helpers ---------------------------------------------------
 
@@ -227,6 +285,9 @@ class TrendsService:
         )
         return self._client.interest_over_time()
 
+    def _suggestions_sync(self, keyword: str) -> list[dict[str, Any]]:
+        return self._client.suggestions(keyword=keyword)
+
 
 def _safe_records(df: Any) -> List[Dict[str, Any]]:
     """Convert a pytrends-returned DataFrame/None into a plain list of dicts."""
@@ -236,5 +297,4 @@ def _safe_records(df: Any) -> List[Dict[str, Any]]:
         if df.empty:
             return []
         return df.to_dict(orient="records")
-    # pytrends is expected to return either None or a DataFrame, but be defensive.
     return list(df) if isinstance(df, list) else []

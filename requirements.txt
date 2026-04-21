@@ -1,3 +1,4 @@
+# --- Runtime ---------------------------------------------------------------
 # Discord bot framework (slash commands via app_commands)
 discord.py>=2.3.2,<3.0.0
 
@@ -8,6 +9,15 @@ pytrends>=4.9.2
 # in urllib3 2.x. Pin to the 1.x line until pytrends ships a fix.
 urllib3<2
 
+# In-memory TTL cache for trend + suggestion results
+cachetools>=5.3.0
+
+# Persistent storage (SQLite by default)
+aiosqlite>=0.19.0
+
+# aiohttp powers both the YouTube Data API client and the healthcheck server
+aiohttp>=3.9.0
+
 # Environment variable loading
 python-dotenv>=1.0.1
 
@@ -16,3 +26,6 @@ matplotlib>=3.8.0
 
 # pytrends transitive dependency pin for stability
 pandas>=2.0.0
+
+# --- Development / tests ---------------------------------------------------
+# Install with: pip install -r requirements.txt -r requirements-dev.txt
