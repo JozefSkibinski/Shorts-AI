@@ -1,1 +1,5 @@
-# Shorts-AI
+Shorts-AI
+
+Shorts-AI is an automated YouTube Shorts trend analysis tool that finds high-performing Shorts in an incognito chrome browser session, avoiding cookies, account history, and algorithm pollution. The scraper scrolls through YouTube Shorts, identifies videos above a chosen view threshold, and logs key details such as title, channel, view count, hashtags, description, duration, transcript, hook, and direct video link. Results are saved in structured files like shorts.jsonl, data.txt, and stats.txt, making the data easy to review, analyze, and reuse.
+
+The project is designed to help identify viral content patterns by summarizing top niches, hashtags, channels, title styles, duration buckets, and hook vocabulary. It also includes a growing data foundation for deeper analysis, including ingestion, enrichment, clustering near-duplicate videos, and ranking top performers by trend signals. Overall, Shorts-AI serves as a research tool for studying what makes Shorts perform well and turning that data into useful content strategy insights
